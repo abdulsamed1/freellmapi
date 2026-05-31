@@ -49,6 +49,7 @@ export function initDb(dbPath?: string): Database.Database {
   migrateModelsV12(db);
   migrateModelsV13(db);
   migrateModelsV14(db);
+  migrateModelsV15(db);
   ensureUnifiedKey(db);
 
   console.log(`Database initialized at ${resolvedPath}`);
@@ -1261,6 +1262,52 @@ function migrateModelsV14(db: Database.Database) {
      WHERE platform = 'cerebras'
        AND model_id IN ('qwen-3-235b-a22b-instruct-2507', 'llama3.1-8b')
   `).run();
+}
+
+/**
+ * V15 (May 2026): MemOS native provider integration.
+ *
+ * Adds MemOS hosted inference models as a first-class FreeLLMAPI provider,
+ * replacing the standalone memos_proxy.py and provider_router.py Python
+ * services. MemOS bridges to memos.memtensor.cn and provides access to
+ * qwen3-32b, deepseek-r1, and qwen2.5-72b-instruct via Token auth.
+ *
+ * The MemOS provider uses a custom API format (not OpenAI-compatible upstream)
+ * but the FreeLLMAPI MemosProvider class translates transparently.
+ */
+function migrateModelsV15(db: Database.Database) {
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO models
+      (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
+       rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  // [platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
+  //  rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window]
+  const additions: [string, string, string, number, number, string,
+    number | null, number | null, number | null, number | null, string, number | null][] = [
+    ['memos', 'qwen3-32b',              'Qwen3 32B (MemOS)',               8, 7, 'Medium', null, null, null, null, '~1-5M', 32768],
+    ['memos', 'deepseek-r1',            'DeepSeek R1 (MemOS)',             3, 9, 'Frontier', null, null, null, null, '~1-5M', 65536],
+    ['memos', 'qwen2.5-72b-instruct',   'Qwen2.5 72B Instruct (MemOS)',    5, 8, 'Large', null, null, null, null, '~1-5M', 32768],
+  ];
+
+  const apply = db.transaction(() => {
+    for (const a of additions) insert.run(...a);
+
+    const missing = db.prepare(`
+      SELECT m.id FROM models m
+      LEFT JOIN fallback_config f ON m.id = f.model_db_id
+      WHERE f.id IS NULL AND m.platform = 'memos'
+      ORDER BY m.intelligence_rank ASC
+    `).all() as { id: number }[];
+    if (missing.length > 0) {
+      const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
+      const addFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+      for (let i = 0; i < missing.length; i++) addFb.run(missing[i].id, maxPriority + i + 1);
+    }
+  });
+  apply();
 }
 
 function ensureUnifiedKey(db: Database.Database) {

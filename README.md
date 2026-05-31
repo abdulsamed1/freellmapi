@@ -99,11 +99,7 @@ git clone https://github.com/tashfeenahmed/freellmapi.git
 cd freellmapi
 npm install
 
-# Generate an encryption key for at-rest key storage
-cp .env.example .env
-echo "ENCRYPTION_KEY=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")" >> .env
-
-# Start server + dashboard together
+# Start server + dashboard together (the centralized .env is already configured)
 npm run dev
 ```
 
