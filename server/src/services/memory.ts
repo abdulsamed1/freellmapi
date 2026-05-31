@@ -71,7 +71,7 @@ export function createSession(session: Omit<Session, 'title' | 'ended_at' | 'end
 
   return runWithRetry(() => {
     db.prepare(`
-      INSERT INTO sessions (id, source, user_id, model, system_prompt, parent_session_id)
+      INSERT INTO chat_sessions (id, source, user_id, model, system_prompt, parent_session_id)
       VALUES (?, ?, ?, ?, ?, ?)
     `).run(
       session.id,
@@ -84,7 +84,7 @@ export function createSession(session: Omit<Session, 'title' | 'ended_at' | 'end
 
     recordWriteAndMaybeCheckpoint();
 
-    const row = db.prepare('SELECT * FROM sessions WHERE id = ?').get(session.id) as Session;
+    const row = db.prepare('SELECT * FROM chat_sessions WHERE id = ?').get(session.id) as Session;
     return row;
   });
 }
@@ -94,7 +94,7 @@ export function createSession(session: Omit<Session, 'title' | 'ended_at' | 'end
  */
 export function getSession(id: string): Session | undefined {
   const db = getDb();
-  return db.prepare('SELECT * FROM sessions WHERE id = ?').get(id) as Session | undefined;
+  return db.prepare('SELECT * FROM chat_sessions WHERE id = ?').get(id) as Session | undefined;
 }
 
 /**
@@ -105,7 +105,7 @@ export function updateSessionUsage(id: string, promptTokens: number, completionT
 
   runWithRetry(() => {
     db.prepare(`
-      UPDATE sessions
+      UPDATE chat_sessions
       SET prompt_tokens = prompt_tokens + ?,
           completion_tokens = completion_tokens + ?,
           total_tokens = total_tokens + ?,
@@ -126,7 +126,7 @@ export function updateSessionUsage(id: string, promptTokens: number, completionT
 export function setSessionTitle(id: string, title: string): void {
   const db = getDb();
   runWithRetry(() => {
-    db.prepare('UPDATE sessions SET title = ?, updated_at = datetime(\'now\') WHERE id = ?').run(title, id);
+    db.prepare('UPDATE chat_sessions SET title = ?, updated_at = datetime(\'now\') WHERE id = ?').run(title, id);
     recordWriteAndMaybeCheckpoint();
   });
 }
@@ -136,7 +136,7 @@ export function setSessionTitle(id: string, title: string): void {
  */
 export function resolveSessionByTitle(title: string): Session | undefined {
   const db = getDb();
-  return db.prepare('SELECT * FROM sessions WHERE title = ?').get(title) as Session | undefined;
+  return db.prepare('SELECT * FROM chat_sessions WHERE title = ?').get(title) as Session | undefined;
 }
 
 /**
@@ -149,7 +149,7 @@ export function getNextTitleInLineage(baseTitle: string): string {
   // Escape LIKE wildcards in the base title to prevent false matches
   const escapedStripped = stripped.replace(/[%_]/g, '\\$&');
   const existing = db.prepare(
-    "SELECT title FROM sessions WHERE title LIKE ? ESCAPE '\\' AND title IS NOT NULL ORDER BY title DESC"
+    "SELECT title FROM chat_sessions WHERE title LIKE ? ESCAPE '\\' AND title IS NOT NULL ORDER BY title DESC"
   ).all(`${escapedStripped}%`) as { title: string }[];
 
   if (existing.length === 0) return stripped;
@@ -173,7 +173,7 @@ export function endSession(id: string, endReason: string): void {
   const db = getDb();
   runWithRetry(() => {
     db.prepare(`
-      UPDATE sessions SET ended_at = datetime('now'), end_reason = ?, updated_at = datetime('now')
+      UPDATE chat_sessions SET ended_at = datetime('now'), end_reason = ?, updated_at = datetime('now')
       WHERE id = ?
     `).run(endReason, id);
     recordWriteAndMaybeCheckpoint();
@@ -187,7 +187,7 @@ export function reopenSession(id: string): void {
   const db = getDb();
   runWithRetry(() => {
     db.prepare(`
-      UPDATE sessions SET ended_at = NULL, end_reason = NULL, updated_at = datetime('now')
+      UPDATE chat_sessions SET ended_at = NULL, end_reason = NULL, updated_at = datetime('now')
       WHERE id = ?
     `).run(id);
     recordWriteAndMaybeCheckpoint();
@@ -291,7 +291,7 @@ export function searchMessages(query: string, options: SearchOptions = {}): Sear
            s.title AS session_title
     FROM messages_fts f
     JOIN messages m ON m.id = f.message_id
-    JOIN sessions s ON s.id = m.session_id
+    JOIN chat_sessions s ON s.id = m.session_id
     WHERE ${conditions.join(' AND ')}
     ORDER BY f.rank
     LIMIT ?
@@ -309,10 +309,10 @@ export function getSessionAncestors(sessionId: string): Session[] {
   // CTE walks parent→grandparent (newest-first), reverse to oldest-first
   const rows = db.prepare(`
     WITH RECURSIVE lineage AS (
-      SELECT s.* FROM sessions s
-      JOIN sessions child ON child.id = ? AND child.parent_session_id = s.id
+      SELECT s.* FROM chat_sessions s
+      JOIN chat_sessions child ON child.id = ? AND child.parent_session_id = s.id
       UNION ALL
-      SELECT s.* FROM sessions s
+      SELECT s.* FROM chat_sessions s
       JOIN lineage l ON s.id = l.parent_session_id
     )
     SELECT * FROM lineage
@@ -327,9 +327,9 @@ export function getSessionDescendants(sessionId: string): Session[] {
   const db = getDb();
   return db.prepare(`
     WITH RECURSIVE descendants AS (
-      SELECT * FROM sessions WHERE parent_session_id = ?
+      SELECT * FROM chat_sessions WHERE parent_session_id = ?
       UNION ALL
-      SELECT s.* FROM sessions s
+      SELECT s.* FROM chat_sessions s
       JOIN descendants d ON s.parent_session_id = d.id
     )
     SELECT * FROM descendants
@@ -373,7 +373,7 @@ export function listRecentSessions(limit = 20, sourceFilter?: string): Array<Ses
               ORDER BY m.timestamp, m.id LIMIT 1),
              ''
            ) AS preview
-    FROM sessions s
+    FROM chat_sessions s
     ${conditions}
     ORDER BY s.created_at DESC
     LIMIT ?
@@ -406,7 +406,7 @@ export function pruneOldSessions(olderThanDays: number, sourceFilter?: string): 
     }
 
     // CASCADE on messages FK handles message cleanup automatically
-    const result = db.prepare(`DELETE FROM sessions WHERE ${conditions.join(' AND ')}`).run(...params);
+    const result = db.prepare(`DELETE FROM chat_sessions WHERE ${conditions.join(' AND ')}`).run(...params);
     recordWriteAndMaybeCheckpoint();
     return result.changes;
   });
@@ -429,7 +429,7 @@ export function clearMessages(sessionId: string): void {
 export function deleteSession(sessionId: string): void {
   const db = getDb();
   runWithRetry(() => {
-    db.prepare('DELETE FROM sessions WHERE id = ?').run(sessionId);
+    db.prepare('DELETE FROM chat_sessions WHERE id = ?').run(sessionId);
     recordWriteAndMaybeCheckpoint();
   });
 }

@@ -3,10 +3,10 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import type { ChatMessage } from '@freellmapi/shared/types.js';
-import { routeRequest, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
+import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown, getNextCooldownDuration } from '../services/ratelimit.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
-import { contentToString } from '../lib/content.js';
+import { contentToString, messageHasImage } from '../lib/content.js';
 
 export const proxyRouter = Router();
 
@@ -23,7 +23,7 @@ function isAutoModel(modelId: string | undefined): boolean {
 // Constant-time string comparison for the unified API key. Plain `===` leaks
 // length and per-character timing, which a network attacker could in principle
 // use to recover the key one byte at a time.
-function timingSafeStringEqual(provided: string, expected: string): boolean {
+export function timingSafeStringEqual(provided: string, expected: string): boolean {
   const a = Buffer.from(provided);
   const b = Buffer.from(expected);
   // Compare against a same-length buffer regardless of input length so the
@@ -31,6 +31,22 @@ function timingSafeStringEqual(provided: string, expected: string): boolean {
   // end is what actually decides equality when lengths differ.
   const compareA = a.length === b.length ? a : Buffer.alloc(b.length);
   return crypto.timingSafeEqual(compareA, b) && a.length === b.length;
+}
+
+// Extract the unified API key from an incoming request. Accepts both the
+// OpenAI-style `Authorization: Bearer <key>` header and the Anthropic-style
+// `x-api-key` header. Clients that speak the Anthropic wire format — notably
+// Claude Code routed through CC Switch (#103) — send the key in `x-api-key`
+// rather than a bearer token, and were getting a spurious "Invalid API key"
+// 401 before this fallback existed.
+export function extractApiToken(req: Request): string | undefined {
+  const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, '').trim();
+  if (bearer) return bearer;
+
+  const apiKeyHeader = req.headers['x-api-key'];
+  const xApiKey = Array.isArray(apiKeyHeader) ? apiKeyHeader[0] : apiKeyHeader;
+  const trimmed = xApiKey?.trim();
+  return trimmed || undefined;
 }
 
 // Sticky sessions: track which model served each "session"
@@ -50,7 +66,7 @@ function getSessionKey(messages: ChatMessage[]): string {
   return `${hash}:${messages.length > 2 ? 'multi' : 'single'}`;
 }
 
-function getStickyModel(messages: ChatMessage[]): number | undefined {
+export function getStickyModel(messages: ChatMessage[]): number | undefined {
   // Only apply sticky for multi-turn (has assistant messages = continuation)
   const hasAssistant = messages.some(m => m.role === 'assistant');
   if (!hasAssistant) return undefined;
@@ -68,7 +84,7 @@ function getStickyModel(messages: ChatMessage[]): number | undefined {
   return entry.modelDbId;
 }
 
-function setStickyModel(messages: ChatMessage[], modelDbId: number) {
+export function setStickyModel(messages: ChatMessage[], modelDbId: number) {
   const key = getSessionKey(messages);
   if (!key) return;
   stickySessionMap.set(key, { modelDbId, lastUsed: Date.now() });
@@ -227,42 +243,12 @@ export function isRetryableError(err: any): boolean {
     || msg.includes('api error 400');
 }
 
-function translateResponsesInputToMessages(input: any[]): any[] {
-  return input.map((item: any) => {
-    let content = '';
-    if (typeof item.content === 'string') {
-      content = item.content;
-    } else if (Array.isArray(item.content)) {
-      content = item.content
-        .map((part: any) => {
-          if (typeof part === 'string') return part;
-          if (part && typeof part === 'object') {
-            return part.text || part.input_text || '';
-          }
-          return '';
-        })
-        .join('');
-    }
-    
-    let role = item.role;
-    if (role === 'developer') {
-      role = 'system';
-    }
-    if (role === 'assistant' && !content && (!item.tool_calls || item.tool_calls.length === 0)) {
-      content = ' ';
-    }
-    return {
-      role,
-      content,
-      ...(item.name ? { name: item.name } : {})
-    };
-  });
-}
-
-async function handleRequest(req: Request, res: Response, isResponsesApi: boolean) {
+async function handleRequest(req: Request, res: Response) {
   const start = Date.now();
-
-  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+  // Authenticate with the unified API key for every proxy request, including
+  // loopback callers. Browser pages can reach localhost, so socket locality is
+  // not a reliable authorization boundary.
+  const token = extractApiToken(req);
   const unifiedKey = getUnifiedApiKey();
   if (!token || !timingSafeStringEqual(token, unifiedKey)) {
     res.status(401).json({
@@ -271,9 +257,7 @@ async function handleRequest(req: Request, res: Response, isResponsesApi: boolea
     return;
   }
 
-  if (isResponsesApi && req.body && Array.isArray(req.body.input)) {
-    req.body.messages = translateResponsesInputToMessages(req.body.input);
-  }
+
 
   if (req.body && Array.isArray(req.body.tools)) {
     req.body.tools = req.body.tools.map((tool: any) => {
@@ -339,7 +323,27 @@ async function handleRequest(req: Request, res: Response, isResponsesApi: boolea
     const text = contentToString(m.content);
     return sum + Math.ceil(text.length / 4);
   }, 0);
-  const estimatedTotal = estimatedInputTokens + (max_tokens ?? 1000);
+
+  // Image requests must route to a vision-capable model. Reject up front with a
+  // clear message when none is enabled, rather than silently dropping the image
+  // or surfacing the generic "all models exhausted" error (#118, #125). Add a
+  // rough per-image token cost so budget routing isn't skewed by content the
+  // heuristic above (text-only) can't see.
+  const hasImage = messageHasImage(messages);
+  if (hasImage && !hasEnabledVisionModel()) {
+    res.status(422).json({
+      error: {
+        message: 'This request includes an image, but no vision-capable model is enabled. Enable a vision model (e.g. Gemini 2.5 Flash, Llama 4 Scout) in the Fallback Chain.',
+        type: 'invalid_request_error',
+        code: 'no_vision_model',
+      },
+    });
+    return;
+  }
+  const IMAGE_TOKEN_ESTIMATE = 1000;
+  const imageCount = messages.reduce((n, m) =>
+    n + (Array.isArray(m.content) ? m.content.filter(b => (b as { type?: string })?.type === 'image_url' || (b as { type?: string })?.type === 'image').length : 0), 0);
+  const estimatedTotal = estimatedInputTokens + imageCount * IMAGE_TOKEN_ESTIMATE + (max_tokens ?? 1000);
 
   let preferredModel: number | undefined;
   if (isAutoModel(requestedModel)) {
@@ -384,7 +388,7 @@ async function handleRequest(req: Request, res: Response, isResponsesApi: boolea
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     let route: RouteResult;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel);
+      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, hasImage);
     } catch (err: any) {
       if (lastError) {
         res.status(429).json({
@@ -415,21 +419,10 @@ async function handleRequest(req: Request, res: Response, isResponsesApi: boolea
 
           for await (const chunk of gen) {
             if (!streamStarted) {
-              if (isResponsesApi) {
-                res.setHeader('Content-Type', 'text/event-stream');
-                res.setHeader('Cache-Control', 'no-cache');
-                res.setHeader('Connection', 'keep-alive');
-                res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
-                
-                const responseId = 'res_' + Date.now();
-                res.write(`data: ${JSON.stringify({ type: 'response.created', response: { id: responseId, created_at: Math.floor(Date.now()/1000), model: route.modelId } })}\n\n`);
-                res.write(`data: ${JSON.stringify({ type: 'response.output_item.added', item: { id: 'item_1', type: 'message', role: 'assistant', content: [{ type: 'text', text: '' }] } })}\n\n`);
-              } else {
-                res.setHeader('Content-Type', 'text/event-stream');
-                res.setHeader('Cache-Control', 'no-cache');
-                res.setHeader('Connection', 'keep-alive');
-                res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
-              }
+              res.setHeader('Content-Type', 'text/event-stream');
+              res.setHeader('Cache-Control', 'no-cache');
+              res.setHeader('Connection', 'keep-alive');
+              res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
               if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
               streamStarted = true;
             }
@@ -437,31 +430,12 @@ async function handleRequest(req: Request, res: Response, isResponsesApi: boolea
             const text = chunk.choices[0]?.delta?.content ?? '';
             totalOutputTokens += Math.ceil(text.length / 4);
             
-            if (isResponsesApi) {
-              if (text) {
-                res.write(`data: ${JSON.stringify({ type: 'response.output_text.delta', item_id: 'item_1', output_index: 0, delta: text })}\n\n`);
-              }
-            } else {
-              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-            }
+            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
           }
 
           if (!streamStarted) {
-            if (isResponsesApi) {
-              res.setHeader('Content-Type', 'text/event-stream');
-              res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
-              const responseId = 'res_' + Date.now();
-              res.write(`data: ${JSON.stringify({ type: 'response.created', response: { id: responseId, created_at: Math.floor(Date.now()/1000), model: route.modelId } })}\n\n`);
-              res.write(`data: ${JSON.stringify({ type: 'response.output_item.added', item: { id: 'item_1', type: 'message', role: 'assistant', content: [{ type: 'text', text: '' }] } })}\n\n`);
-            } else {
-              res.setHeader('Content-Type', 'text/event-stream');
-              res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
-            }
-          }
-
-          if (isResponsesApi) {
-            res.write(`data: ${JSON.stringify({ type: 'response.output_item.done', item: { id: 'item_1' } })}\n\n`);
-            res.write(`data: ${JSON.stringify({ type: 'response.completed', response: { usage: { total_tokens: estimatedInputTokens + totalOutputTokens } } })}\n\n`);
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
           }
           res.write('data: [DONE]\n\n');
           res.end();
@@ -496,30 +470,7 @@ async function handleRequest(req: Request, res: Response, isResponsesApi: boolea
         res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
         if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
         
-        if (isResponsesApi) {
-          const responseId = 'res_' + Date.now();
-          res.json({
-            id: responseId,
-            object: 'response',
-            created_at: Math.floor(Date.now() / 1000),
-            model: route.modelId,
-            status: 'completed',
-            output: [{
-              id: 'item_1',
-              type: 'message',
-              role: 'assistant',
-              content: [{
-                type: 'text',
-                text: result.choices[0]?.message?.content ?? ''
-              }]
-            }],
-            usage: {
-              total_tokens: totalTokens
-            }
-          });
-        } else {
-          res.json(result);
-        }
+        res.json(result);
 
         logRequest(
           route.platform, route.modelId, route.keyId, 'success',
@@ -566,15 +517,11 @@ async function handleRequest(req: Request, res: Response, isResponsesApi: boolea
   });
 }
 
-proxyRouter.post('/responses', async (req: Request, res: Response) => {
-  await handleRequest(req, res, true);
-});
-
 proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
-  await handleRequest(req, res, false);
+  await handleRequest(req, res);
 });
 
-function logRequest(
+export function logRequest(
   platform: string,
   modelId: string,
   keyId: number,

@@ -275,7 +275,7 @@ describe('Memory Service & Hermes Session Storage', () => {
     endSession('old-session', 'user_exit');
 
     // Backdate to 100 days ago
-    db.prepare("UPDATE sessions SET created_at = datetime('now', '-100 days') WHERE id = 'old-session'").run();
+    db.prepare("UPDATE chat_sessions SET created_at = datetime('now', '-100 days') WHERE id = 'old-session'").run();
 
     // Create a recent ended session
     createSession({
@@ -289,7 +289,7 @@ describe('Memory Service & Hermes Session Storage', () => {
       id: 'active-session', source: 'cli', user_id: null,
       model: 'auto', system_prompt: null, parent_session_id: null
     });
-    db.prepare("UPDATE sessions SET created_at = datetime('now', '-100 days') WHERE id = 'active-session'").run();
+    db.prepare("UPDATE chat_sessions SET created_at = datetime('now', '-100 days') WHERE id = 'active-session'").run();
 
     // Prune sessions older than 90 days
     const pruned = pruneOldSessions(90);
