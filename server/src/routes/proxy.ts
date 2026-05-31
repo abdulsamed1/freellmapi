@@ -346,15 +346,34 @@ async function handleRequest(req: Request, res: Response, isResponsesApi: boolea
     preferredModel = getStickyModel(messages);
   } else if (requestedModel) {
     const db = getDb();
-    let enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
-    if (!enabled) {
-      enabled = db.prepare('SELECT id FROM models WHERE (model_id LIKE ? OR model_id = ?) AND enabled = 1').get(`%/${requestedModel}`, requestedModel) as { id: number } | undefined;
+    let modelRow = db.prepare('SELECT id, enabled FROM models WHERE model_id = ?').get(requestedModel) as { id: number; enabled: number } | undefined;
+    if (!modelRow) {
+      modelRow = db.prepare('SELECT id, enabled FROM models WHERE (model_id LIKE ? OR model_id = ?)').get(`%/${requestedModel}`, requestedModel) as { id: number; enabled: number } | undefined;
     }
-    if (enabled) {
-      preferredModel = enabled.id;
-    } else {
-      preferredModel = getStickyModel(messages);
+
+    if (!modelRow) {
+      res.status(400).json({
+        error: {
+          message: `Model "${requestedModel}" is not in the catalog.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
     }
+
+    if (modelRow.enabled === 0) {
+      res.status(400).json({
+        error: {
+          message: `Model "${requestedModel}" is disabled.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
+    }
+
+    preferredModel = modelRow.id;
   } else {
     preferredModel = getStickyModel(messages);
   }

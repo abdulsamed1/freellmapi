@@ -28,7 +28,8 @@ export function initDb(dbPath?: string): Database.Database {
     }
   }
 
-  db = new Database(resolvedPath);
+  // Nous Research Hermes contention protocol: 1-second timeout
+  db = new Database(resolvedPath, { timeout: 1000 });
   if (!isMemory) db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
 
@@ -50,6 +51,7 @@ export function initDb(dbPath?: string): Database.Database {
   migrateModelsV13(db);
   migrateModelsV14(db);
   migrateModelsV15(db);
+  migrateModelsV16(db);
   ensureUnifiedKey(db);
 
   console.log(`Database initialized at ${resolvedPath}`);
@@ -1330,4 +1332,132 @@ export function regenerateUnifiedKey(): string {
   const key = `freellmapi-${crypto.randomBytes(24).toString('hex')}`;
   db.prepare("UPDATE settings SET value = ? WHERE key = 'unified_api_key'").run(key);
   return key;
+}
+
+function migrateModelsV16(db: Database.Database) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      source TEXT NOT NULL,
+      user_id TEXT,
+      model TEXT,
+      system_prompt TEXT,
+      parent_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+      title TEXT,
+      ended_at TEXT,
+      end_reason TEXT,
+      prompt_tokens INTEGER NOT NULL DEFAULT 0,
+      completion_tokens INTEGER NOT NULL DEFAULT 0,
+      total_tokens INTEGER NOT NULL DEFAULT 0,
+      cost REAL NOT NULL DEFAULT 0.0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
+    CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
+    CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique ON sessions(title) WHERE title IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS messages (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      tool_calls TEXT,
+      reasoning TEXT,
+      reasoning_content TEXT,
+      timestamp REAL NOT NULL DEFAULT (strftime('%s', 'now') || '.' || substr(strftime('%f', 'now'), 4)),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+
+    CREATE TRIGGER IF NOT EXISTS update_session_timestamp_on_message_insert
+    AFTER INSERT ON messages
+    BEGIN
+      UPDATE sessions SET updated_at = datetime('now') WHERE id = NEW.session_id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS update_session_timestamp_on_message_update
+    AFTER UPDATE ON messages
+    BEGIN
+      UPDATE sessions SET updated_at = datetime('now') WHERE id = NEW.session_id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS update_session_timestamp_on_message_delete
+    AFTER DELETE ON messages
+    BEGIN
+      UPDATE sessions SET updated_at = datetime('now') WHERE id = OLD.session_id;
+    END;
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+      message_id UNINDEXED,
+      session_id UNINDEXED,
+      role,
+      content
+    );
+
+    CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+      INSERT INTO messages_fts(message_id, session_id, role, content) VALUES (NEW.id, NEW.session_id, NEW.role, NEW.content);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+      DELETE FROM messages_fts WHERE message_id = OLD.id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
+      UPDATE messages_fts SET role = NEW.role, content = NEW.content WHERE message_id = NEW.id;
+    END;
+  `);
+
+  // Declarative column reconciliation for existing databases (idempotent)
+  const sessionCols = db.prepare('PRAGMA table_info(sessions)').all() as { name: string }[];
+  const colNames = new Set(sessionCols.map(c => c.name));
+  if (!colNames.has('title')) {
+    try { db.prepare('ALTER TABLE sessions ADD COLUMN title TEXT').run(); } catch {}
+  }
+  if (!colNames.has('ended_at')) {
+    try { db.prepare('ALTER TABLE sessions ADD COLUMN ended_at TEXT').run(); } catch {}
+  }
+  if (!colNames.has('end_reason')) {
+    try { db.prepare('ALTER TABLE sessions ADD COLUMN end_reason TEXT').run(); } catch {}
+  }
+}
+
+const sharedBuffer = new Int32Array(new SharedArrayBuffer(4));
+export function sleepSync(ms: number) {
+  Atomics.wait(sharedBuffer, 0, 0, ms);
+}
+
+export function runWithRetry<T>(fn: () => T, maxRetries = 15): T {
+  let attempt = 0;
+  while (true) {
+    try {
+      return fn();
+    } catch (err: any) {
+      const isLocked = err.code === 'SQLITE_BUSY' || err.message?.includes('busy') || err.message?.includes('locked');
+      if (isLocked && attempt < maxRetries) {
+        attempt++;
+        const jitter = Math.floor(Math.random() * (150 - 20 + 1) + 20);
+        sleepSync(jitter);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+let writeCounter = 0;
+export function recordWriteAndMaybeCheckpoint() {
+  writeCounter++;
+  if (writeCounter >= 50) {
+    writeCounter = 0;
+    try {
+      const database = getDb();
+      database.pragma('wal_checkpoint(PASSIVE)');
+    } catch (err) {
+      console.error('WAL checkpoint failed:', err);
+    }
+  }
 }
