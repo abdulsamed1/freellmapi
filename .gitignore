@@ -13,4 +13,7 @@ server/data/
 deploy-pi.sh
 update-hermes.sh
 repo-assets/
-docs/
+docs/logos
+docs/index.html
+docs/og.png
+docs/og.svg
