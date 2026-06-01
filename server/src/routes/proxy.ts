@@ -4,7 +4,7 @@ import type { Request, Response } from 'express';
 import { z } from 'zod';
 import type { ChatMessage } from '@freellmapi/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, type RouteResult } from '../services/router.js';
-import { recordRequest, recordTokens, setCooldown, getNextCooldownDuration } from '../services/ratelimit.js';
+import { recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit } from '../services/ratelimit.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { contentToString, messageHasImage } from '../lib/content.js';
 
@@ -243,6 +243,16 @@ export function isRetryableError(err: any): boolean {
     || msg.includes('api error 400');
 }
 
+// Pull the incremental text out of a streaming chunk for token counting.
+// Must tolerate chunks that carry no `choices` array at all: some providers
+// (e.g. Groq) emit usage/keepalive frames shaped like `{usage:{...}}` with no
+// `choices`. Indexing `chunk.choices[0]` on those throws "Cannot read
+// properties of undefined (reading '0')", which — once the SSE stream has
+// started — aborts the response mid-flight with no chance to fall back.
+export function streamChunkText(chunk: any): string {
+  return chunk?.choices?.[0]?.delta?.content ?? '';
+}
+
 async function handleRequest(req: Request, res: Response) {
   const start = Date.now();
   // Authenticate with the unified API key for every proxy request, including
@@ -427,7 +437,7 @@ async function handleRequest(req: Request, res: Response) {
               streamStarted = true;
             }
             
-            const text = chunk.choices[0]?.delta?.content ?? '';
+            const text = streamChunkText(chunk);
             totalOutputTokens += Math.ceil(text.length / 4);
             
             res.write(`data: ${JSON.stringify(chunk)}\n\n`);
@@ -491,7 +501,10 @@ async function handleRequest(req: Request, res: Response) {
           route.platform,
           route.modelId,
           route.keyId,
-          getNextCooldownDuration(route.platform, route.modelId, route.keyId),
+          getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, {
+            rpd: route.rpdLimit,
+            tpd: route.tpdLimit,
+          }),
         );
         recordRateLimitHit(route.modelDbId);
         lastError = err;
