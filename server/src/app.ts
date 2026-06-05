@@ -8,6 +8,7 @@ import { modelsRouter } from './routes/models.js';
 import { proxyRouter } from './routes/proxy.js';
 import { responsesRouter } from './routes/responses.js';
 import { fallbackRouter } from './routes/fallback.js';
+import { embeddingsRouter } from './routes/embeddings.js';
 import { analyticsRouter } from './routes/analytics.js';
 import { healthRouter } from './routes/health.js';
 import { settingsRouter } from './routes/settings.js';
@@ -49,7 +50,10 @@ export function createApp() {
       callback(null, !origin || allowedCorsOrigins.has(origin));
     },
   }));
-  app.use(express.json({ limit: '1mb' }));
+  // 10mb: code agents (OpenCode, AionUI, Qwen Code) ship very large system
+  // prompts + tool schemas + repo context; 1mb cut their sessions off
+  // mid-conversation with an opaque 413. (#200)
+  app.use(express.json({ limit: '10mb' }));
 
   // Dashboard auth (#35): /api/auth/{status,setup,login} bootstrap without a
   // session; everything else under /api/* requires a logged-in dashboard user.
@@ -60,6 +64,7 @@ export function createApp() {
   app.use('/api/keys', requireAuth, keysRouter);
   app.use('/api/models', requireAuth, modelsRouter);
   app.use('/api/fallback', requireAuth, fallbackRouter);
+  app.use('/api/embeddings', requireAuth, embeddingsRouter);
   app.use('/api/analytics', requireAuth, analyticsRouter);
   app.use('/api/health', requireAuth, healthRouter);
   app.use('/api/settings', requireAuth, settingsRouter);
@@ -80,8 +85,12 @@ export function createApp() {
   // Error handler (for API routes)
   app.use(errorHandler);
 
-  // Serve client static files (after API error handler)
-  const clientDist = path.resolve(__dirname, '../../client/dist');
+  // Serve client static files (after API error handler). CLIENT_DIST lets
+  // embedders relocate the built dashboard (e.g. the desktop app ships it in
+  // extraResources, where the __dirname-relative path can't reach).
+  const clientDist = process.env.CLIENT_DIST
+    ? path.resolve(process.env.CLIENT_DIST)
+    : path.resolve(__dirname, '../../client/dist');
   app.use(express.static(clientDist));
   // SPA fallback — serve index.html for non-API routes
   app.use((req, res, next) => {

@@ -2,11 +2,15 @@ import crypto from 'crypto';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
-import type { ChatMessage } from '@freellmapi/shared/types.js';
-import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, type RouteResult } from '../services/router.js';
-import { recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit } from '../services/ratelimit.js';
+import type { ChatMessage, ModelListRow } from '@freellmapi/shared/types.js';
+import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, hasEnabledToolsModel, type RouteResult } from '../services/router.js';
+import { recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit, PAYMENT_REQUIRED_COOLDOWN_MS } from '../services/ratelimit.js';
+import { pruneRequestAnalytics } from '../services/request-retention.js';
+import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
-import { contentToString, messageHasImage } from '../lib/content.js';
+import { contentToString, messageHasImage, normalizeOutboundContent } from '../lib/content.js';
+import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
+import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 
 export const proxyRouter = Router();
 
@@ -99,9 +103,30 @@ export function setStickyModel(messages: ChatMessage[], modelDbId: number) {
 }
 
 // OpenAI-compatible /models endpoint (used by Hermes for metadata)
-proxyRouter.get('/models', (_req: Request, res: Response) => {
+proxyRouter.get('/models', (req: Request, res: Response) => {
+  const token = extractApiToken(req);
+  const unifiedKey = getUnifiedApiKey();
+  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+    res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
+    return;
+  }
+
   const db = getDb();
-  const models = db.prepare('SELECT platform, model_id, display_name, context_window FROM models WHERE enabled = 1 ORDER BY intelligence_rank').all() as any[];
+  const models = db.prepare(`
+    SELECT platform, model_id, display_name, context_window
+    FROM (
+      SELECT platform, model_id, display_name, context_window, intelligence_rank, id,
+             ROW_NUMBER() OVER (
+               PARTITION BY model_id
+               ORDER BY intelligence_rank ASC, id ASC
+             ) AS rn
+      FROM models
+      WHERE enabled = 1
+    )
+    WHERE rn = 1
+    ORDER BY intelligence_rank ASC, id ASC
+  `).all() as ModelListRow[];
+
   res.json({
     object: 'list',
     data: [
@@ -127,32 +152,45 @@ proxyRouter.get('/models', (_req: Request, res: Response) => {
 
 const MAX_RETRIES = 20;
 
+// Echo-tolerant tool calls: agents replay OUR responses back as history, and
+// not all of them preserve the strict OpenAI shape. `type` may be dropped
+// (re-added on forward), and Gemini-lineage agents (Qwen Code, AionUI) often
+// send `arguments` as a parsed object instead of a JSON string — both get
+// normalized below rather than 400-ing the whole session. (#200)
 const toolCallSchema = z.object({
   id: z.string().min(1),
-  type: z.literal('function'),
+  type: z.literal('function').optional(),
   function: z.object({
     name: z.string().min(1),
-    arguments: z.string(),
+    arguments: z.union([z.string(), z.record(z.string(), z.unknown())]),
   }),
   thought_signature: z.string().optional(),
 });
 
-// OpenAI multimodal envelope. Clients like opencode / continue.dev send
-// content as an array of typed blocks even when only text is present. We
-// accept the envelope on the wire and flatten to string for providers that
-// don't support arrays (Cohere, Cloudflare). Non-text blocks pass z validation
-// but get dropped by contentToString — vision/audio still isn't supported.
-const contentBlockSchema = z.object({ type: z.string() }).passthrough();
-const contentSchema = z.union([z.string(), z.array(contentBlockSchema)]);
+const toolCallArgsToString = (args: string | Record<string, unknown>): string =>
+  typeof args === 'string' ? args : JSON.stringify(args);
 
-function hasNonEmptyContent(content: unknown): boolean {
-  if (typeof content === 'string') return content.length > 0;
-  if (Array.isArray(content)) return content.length > 0;
-  return false;
-}
+// OpenAI multimodal envelope. Clients like opencode / continue.dev send
+// content as an array of typed blocks even when only text is present, and
+// Gemini-lineage agents send part-style blocks like `{ "text": "..." }` with
+// no `type` at all. Accept any object (or bare string) as a block; flatten to
+// string for providers that don't support arrays (Cohere, Cloudflare).
+// Non-text blocks pass z validation but get dropped by contentToString —
+// vision/audio still isn't supported. (#200)
+const contentBlockSchema = z.union([z.string(), z.record(z.string(), z.unknown())]);
+const contentSchema = z.union([z.string(), z.array(contentBlockSchema)]);
 
 const systemMessageSchema = z.object({
   role: z.literal('system'),
+  content: contentSchema,
+  name: z.string().optional(),
+});
+
+// OpenAI's newer SDKs send the system prompt as role:"developer"; accept it
+// and forward as "system" — none of the routed providers know the developer
+// role. (#200)
+const developerMessageSchema = z.object({
+  role: z.literal('developer'),
   content: contentSchema,
   name: z.string().optional(),
 });
@@ -163,17 +201,17 @@ const userMessageSchema = z.object({
   name: z.string().optional(),
 });
 
+// Assistant turns may carry empty/null content and no tool_calls — OpenAI
+// accepts these in conversation history (a turn that produced no visible text,
+// a placeholder, a tool turn whose content was emptied), and clients replay
+// them verbatim. We accept them too and coerce empty/null content to "" before
+// forwarding (see message build below) rather than 400-ing a payload OpenAI
+// would take. (#165)
 const assistantMessageSchema = z.object({
   role: z.literal('assistant'),
   content: z.union([contentSchema, z.null()]).optional(),
   name: z.string().optional(),
   tool_calls: z.array(toolCallSchema).optional(),
-}).refine((msg) => {
-  const hasContent = hasNonEmptyContent(msg.content);
-  const hasToolCalls = (msg.tool_calls?.length ?? 0) > 0;
-  return hasContent || hasToolCalls;
-}, {
-  message: 'assistant messages must include non-empty content or tool_calls',
 });
 
 const toolMessageSchema = z.object({
@@ -206,6 +244,7 @@ const toolChoiceSchema = z.union([
 const chatCompletionSchema = z.object({
   messages: z.array(z.union([
     systemMessageSchema,
+    developerMessageSchema,
     userMessageSchema,
     assistantMessageSchema,
     toolMessageSchema,
@@ -240,7 +279,23 @@ export function isRetryableError(err: any): boolean {
     // limits, unsupported params). The matching pattern is "api error 400"
     // which comes from the OpenAI-compat provider's error formatting, not
     // a bare "400" which is deliberately non-retryable for validation errors.
-    || msg.includes('api error 400');
+    || msg.includes('api error 400')
+    // 402: this provider/key is out of credits (e.g. HuggingFace Router
+    // "API error 402: Payment required"). The SAME model often lives on another
+    // provider (Kimi K2.6 is on HF + Cloudflare + NVIDIA), so fail over instead
+    // of killing the workflow. Paired with a long cooldown (isPaymentRequiredError)
+    // so we don't re-hammer the broke key every retry.
+    || isPaymentRequiredError(err);
+}
+
+// A 402 Payment Required / out-of-credits error. Distinct from a transient 429:
+// it won't recover on the next window, so the caller benches the model+key with
+// PAYMENT_REQUIRED_COOLDOWN_MS (a full day) rather than the 90s transient cooldown.
+export function isPaymentRequiredError(err: any): boolean {
+  const msg = (err.message ?? '').toLowerCase();
+  return msg.includes('402') || msg.includes('payment required')
+    || msg.includes('insufficient_quota') || msg.includes('insufficient credit')
+    || msg.includes('insufficient balance');
 }
 
 // Pull the incremental text out of a streaming chunk for token counting.
@@ -252,6 +307,45 @@ export function isRetryableError(err: any): boolean {
 export function streamChunkText(chunk: any): string {
   return chunk?.choices?.[0]?.delta?.content ?? '';
 }
+
+// OpenAI-compatible embeddings endpoint, routed through the embeddings family
+// catalog: `model: "auto"` (or omitted) → the configured default family; a
+// family name or provider model id → that family's provider chain. Failover
+// only happens WITHIN a family (same model on another provider) — never across
+// models, since vectors from different models are incompatible.
+const EmbeddingsBody = z.object({
+  model: z.string().optional(),
+  input: z.union([z.string(), z.array(z.string())]),
+});
+
+proxyRouter.post('/embeddings', async (req: Request, res: Response) => {
+  const token = extractApiToken(req);
+  const unifiedKey = getUnifiedApiKey();
+  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+    res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
+    return;
+  }
+  const parsed = EmbeddingsBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: 'Invalid request: `input` is required', type: 'invalid_request_error' } });
+    return;
+  }
+  const inputs = Array.isArray(parsed.data.input) ? parsed.data.input : [parsed.data.input];
+  try {
+    const result = await runEmbeddings(parsed.data.model, inputs);
+    res.json({
+      object: 'list',
+      data: result.vectors.map((values, i) => ({ object: 'embedding', index: i, embedding: values })),
+      model: result.family,
+      provider: result.platform,
+      usage: { prompt_tokens: result.inputTokens, total_tokens: result.inputTokens },
+    });
+  } catch (err: any) {
+    const status = err instanceof EmbeddingsError ? err.status : 502;
+    const type = status === 400 ? 'invalid_request_error' : status === 429 ? 'rate_limit_error' : 'server_error';
+    res.status(status).json({ error: { message: `embedding error: ${err?.message ?? 'unknown'}`, type } });
+  }
+});
 
 async function handleRequest(req: Request, res: Response) {
   const start = Date.now();
@@ -288,9 +382,17 @@ async function handleRequest(req: Request, res: Response) {
 
   const parsed = chatCompletionSchema.safeParse(req.body);
   if (!parsed.success) {
+    // Path-qualified issues ("messages.1.content: Invalid input" beats a bare
+    // "Invalid input") and a server-side breadcrumb — these rejections never
+    // reach the request log, which made #200 nearly undebuggable.
+    const detail = parsed.error.errors
+      .map(e => (e.path.length ? `${e.path.join('.')}: ${e.message}` : e.message))
+      .slice(0, 5)
+      .join(', ');
+    console.warn(`[proxy] 400 invalid /chat/completions request: ${detail}`);
     res.status(400).json({
       error: {
-        message: `Invalid request: ${parsed.error.errors.map(e => e.message).join(', ')}`,
+        message: `Invalid request: ${detail}`,
         type: 'invalid_request_error',
       },
     });
@@ -300,14 +402,26 @@ async function handleRequest(req: Request, res: Response) {
   const { model: requestedModel, temperature, max_tokens, top_p, stream, tools, tool_choice, parallel_tool_calls } = parsed.data;
   const messages: ChatMessage[] = parsed.data.messages.map((m): ChatMessage => {
     if (m.role === 'assistant') {
+      const hasToolCalls = (m.tool_calls?.length ?? 0) > 0;
+      // With tool_calls, content: null is the correct OpenAI shape — keep it.
+      // Without tool_calls, coerce empty/null content to "" so strict upstreams
+      // don't choke on a null-content assistant turn we just accepted. (#165)
+      const isEmptyContent = m.content == null
+        || (typeof m.content === 'string' && m.content.length === 0)
+        || (Array.isArray(m.content) && m.content.length === 0);
+      const assistantContent: ChatMessage['content'] = hasToolCalls
+        ? (m.content ?? null)
+        : (isEmptyContent ? '' : m.content!);
       return {
         role: 'assistant',
-        content: m.content ?? null,
+        content: assistantContent,
         ...(m.name ? { name: m.name } : {}),
         ...(m.tool_calls ? { tool_calls: m.tool_calls.map(tc => ({
           id: tc.id,
-          type: tc.type,
-          function: tc.function,
+          // Normalize echo-tolerant inputs back to the strict OpenAI shape
+          // before forwarding (see toolCallSchema). (#200)
+          type: 'function' as const,
+          function: { name: tc.function.name, arguments: toolCallArgsToString(tc.function.arguments) },
           thought_signature: tc.thought_signature,
         })) } : {}),
       };
@@ -323,7 +437,9 @@ async function handleRequest(req: Request, res: Response) {
     }
 
     return {
-      role: m.role,
+      // 'developer' is OpenAI's newer name for the system role — providers
+      // downstream only know 'system'. (#200)
+      role: m.role === 'developer' ? 'system' : m.role,
       content: m.content,
       ...(m.name ? { name: m.name } : {}),
     };
@@ -355,6 +471,27 @@ async function handleRequest(req: Request, res: Response) {
     n + (Array.isArray(m.content) ? m.content.filter(b => (b as { type?: string })?.type === 'image_url' || (b as { type?: string })?.type === 'image').length : 0), 0);
   const estimatedTotal = estimatedInputTokens + imageCount * IMAGE_TOKEN_ESTIMATE + (max_tokens ?? 1000);
 
+  // Tool-bearing requests must route to a model that emits STRUCTURED
+  // tool_calls. A model without real function-calling support serializes the
+  // call into its text answer — the request "succeeds" but the client's tool
+  // loop sees nothing, which is strictly worse than an error. Same up-front
+  // gate pattern as vision above.
+  const wantsTools = (tools?.length ?? 0) > 0;
+  if (wantsTools && !hasEnabledToolsModel()) {
+    res.status(422).json({
+      error: {
+        message: 'This request includes tools, but no tool-capable model is enabled. Enable a tool-calling model (e.g. GPT-OSS 120B, Gemini 3.5 Flash, GLM-4.7) in the Fallback Chain.',
+        type: 'invalid_request_error',
+        code: 'no_tools_model',
+      },
+    });
+    return;
+  }
+
+  // Explicit `model` field pins routing. If the catalog has no enabled row
+  // matching the requested id, return 400 — silently auto-routing to a
+  // different model would be surprising to OpenAI-compatible clients.
+  // Sticky-session is the fallback when no `model` field was sent at all.
   let preferredModel: number | undefined;
   if (isAutoModel(requestedModel)) {
     preferredModel = getStickyModel(messages);
@@ -398,12 +535,13 @@ async function handleRequest(req: Request, res: Response) {
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     let route: RouteResult;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, hasImage);
+      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, hasImage, wantsTools);
     } catch (err: any) {
       if (lastError) {
+        const safeLastError = sanitizeProviderErrorMessage(lastError.message);
         res.status(429).json({
           error: {
-            message: `All models rate-limited. Last error: ${lastError.message}`,
+            message: `All models rate-limited. Last error: ${safeLastError}`,
             type: 'rate_limit_error',
           },
         });
@@ -421,6 +559,7 @@ async function handleRequest(req: Request, res: Response) {
       if (stream) {
         let totalOutputTokens = 0;
         let streamStarted = false;
+        let ttfbMs: number | null = null;
         try {
           const gen = route.provider.streamChatCompletion(
             route.apiKey, messages, route.modelId,
@@ -429,6 +568,9 @@ async function handleRequest(req: Request, res: Response) {
 
           for await (const chunk of gen) {
             if (!streamStarted) {
+              // Time-to-first-byte: dispatch → first chunk. Feeds the router's
+              // latency axis (server/src/services/scoring.ts).
+              ttfbMs = Date.now() - start;
               res.setHeader('Content-Type', 'text/event-stream');
               res.setHeader('Cache-Control', 'no-cache');
               res.setHeader('Connection', 'keep-alive');
@@ -436,7 +578,9 @@ async function handleRequest(req: Request, res: Response) {
               if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
               streamStarted = true;
             }
-            
+            // Coerce array-shaped delta.content to a string before forwarding,
+            // so spec-conforming clients don't break and tool_calls survive (#166).
+            normalizeOutboundContent(chunk);
             const text = streamChunkText(chunk);
             totalOutputTokens += Math.ceil(text.length / 4);
             
@@ -444,8 +588,17 @@ async function handleRequest(req: Request, res: Response) {
           }
 
           if (!streamStarted) {
-            res.setHeader('Content-Type', 'text/event-stream');
-            res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+            // Upstream returned zero chunks — an empty completion in stream
+            // clothing. No headers are out yet, so fail over to the next model
+            // instead of handing the client a valid-looking empty stream
+            // (production case: nemotron-3-super returning nothing on large
+            // contexts while the request logs as success).
+            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (stream produced no chunks)');
+            skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
+            setCooldown(route.platform, route.modelId, route.keyId, getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+            recordRateLimitHit(route.modelDbId);
+            lastError = new Error(`empty completion from ${route.displayName}`);
+            continue;
           }
           res.write('data: [DONE]\n\n');
           res.end();
@@ -453,7 +606,7 @@ async function handleRequest(req: Request, res: Response) {
           recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
           recordSuccess(route.modelDbId);
           setStickyModel(messages, route.modelDbId);
-          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null);
+          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null, ttfbMs);
           return;
         } catch (streamErr: any) {
           if (streamStarted) {
@@ -461,7 +614,7 @@ async function handleRequest(req: Request, res: Response) {
             const payload = { error: { message: `Provider error (${route.displayName}): stream interrupted`, type: 'stream_error' } };
             try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* socket gone */ }
             try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
-            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, streamErr.message);
+            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message));
             return;
           }
           throw streamErr;
@@ -472,6 +625,20 @@ async function handleRequest(req: Request, res: Response) {
           { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls },
         );
 
+        // Empty completion (no text, no tool calls) → fail over rather than
+        // return a transport-level "success" the caller can't act on. Mirrors
+        // the zero-chunk streaming case above.
+        const respMsg = result.choices?.[0]?.message;
+        const respText = contentToString(respMsg?.content ?? '');
+        if (!respText && (respMsg?.tool_calls?.length ?? 0) === 0) {
+          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)');
+          skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
+          setCooldown(route.platform, route.modelId, route.keyId, getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+          recordRateLimitHit(route.modelDbId);
+          lastError = new Error(`empty completion from ${route.displayName}`);
+          continue;
+        }
+
         const totalTokens = result.usage?.total_tokens ?? 0;
         recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
         recordSuccess(route.modelDbId);
@@ -479,8 +646,20 @@ async function handleRequest(req: Request, res: Response) {
 
         res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
         if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
-        
-        res.json(result);
+        // Repair double-encoded tool arguments against the request's tool
+        // schemas (e.g. GLM emitting an array parameter as a JSON string),
+        // so strict clients don't reject the call. Schema-gated — a true
+        // string parameter is never touched. See lib/tool-args.ts.
+        if (respMsg?.tool_calls?.length) {
+          const schemas = toolSchemaMap(tools);
+          for (const tc of respMsg.tool_calls) {
+            if (tc?.function?.arguments != null) {
+              tc.function.arguments = repairToolArguments(tc.function.arguments, schemas.get(tc.function.name));
+            }
+          }
+        }
+        // Normalize array-shaped message.content to a string on the way out (#166).
+        res.json(normalizeOutboundContent(result));
 
         logRequest(
           route.platform, route.modelId, route.keyId, 'success',
@@ -492,7 +671,8 @@ async function handleRequest(req: Request, res: Response) {
       }
     } catch (err: any) {
       const latency = Date.now() - start;
-      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, err.message);
+      const safeError = sanitizeProviderErrorMessage(err.message);
+      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError);
 
       if (isRetryableError(err)) {
         const skipId = `${route.platform}:${route.modelId}:${route.keyId}`;
@@ -501,20 +681,22 @@ async function handleRequest(req: Request, res: Response) {
           route.platform,
           route.modelId,
           route.keyId,
-          getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, {
-            rpd: route.rpdLimit,
-            tpd: route.tpdLimit,
-          }),
+          isPaymentRequiredError(err)
+            ? PAYMENT_REQUIRED_COOLDOWN_MS
+            : getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, {
+                rpd: route.rpdLimit,
+                tpd: route.tpdLimit,
+              }),
         );
         recordRateLimitHit(route.modelDbId);
         lastError = err;
-        console.log(`[Proxy] ${err.message.slice(0, 60)} from ${route.displayName}, falling back (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        console.log(`[Proxy] ${safeError.slice(0, 60)} from ${route.displayName}, falling back (attempt ${attempt + 1}/${MAX_RETRIES})`);
         continue;
       }
 
       res.status(502).json({
         error: {
-          message: `Provider error (${route.displayName}): ${err.message}`,
+          message: `Provider error (${route.displayName}): ${safeError}`,
           type: 'provider_error',
         },
       });
@@ -524,7 +706,7 @@ async function handleRequest(req: Request, res: Response) {
 
   res.status(429).json({
     error: {
-      message: `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastError?.message}`,
+      message: `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${sanitizeProviderErrorMessage(lastError?.message)}`,
       type: 'rate_limit_error',
     },
   });
@@ -543,13 +725,15 @@ export function logRequest(
   outputTokens: number,
   latencyMs: number,
   error: string | null,
+  ttfbMs: number | null = null,
 ) {
   try {
     const db = getDb();
     db.prepare(`
-      INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error);
+      INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, ttfb_ms)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error, ttfbMs);
+    pruneRequestAnalytics({ db });
   } catch (e) {
     console.error('Failed to log request:', e);
   }

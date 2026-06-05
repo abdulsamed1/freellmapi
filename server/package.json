@@ -1,6 +1,6 @@
 {
   "name": "@freellmapi/server",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "@freellmapi/shared": "*",
-    "better-sqlite3": "^12.4.1",
+    "better-sqlite3": "^12.10.0",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.44.2",

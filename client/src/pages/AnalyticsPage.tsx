@@ -8,6 +8,7 @@ import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { PageHeader } from '@/components/page-header'
+import { formatSqliteUtcToLocalTime } from '@/lib/utils'
 
 type TimeRange = '24h' | '7d' | '30d'
 
@@ -18,18 +19,25 @@ function formatTokens(n?: number): string {
   return String(n)
 }
 
-function Stat({ label, value, className }: { label: string; value: string | number; className?: string }) {
+function Stat({ label, value, hint, className }: { label: string; value: string | number; hint?: string; className?: string }) {
   return (
-    <div className="rounded-lg border bg-card px-4 py-3">
+    <div className="relative group rounded-3xl border bg-card px-4 py-3">
       <p className="text-[11px] text-muted-foreground uppercase tracking-wider">{label}</p>
       <p className={`text-xl font-semibold tabular-nums mt-1 ${className ?? ''}`}>{value}</p>
+      {hint && (
+        // Opens BELOW the card: the stats row sits right under the sticky
+        // navbar, and an upward tooltip slides beneath it.
+        <div className="pointer-events-none absolute left-1/2 -translate-x-1/2 top-full mt-1.5 hidden group-hover:block z-50 w-56 rounded-lg border bg-popover px-3 py-2 text-xs leading-relaxed text-popover-foreground shadow-md">
+          {hint}
+        </div>
+      )}
     </div>
   )
 }
 
 function Panel({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <div className="rounded-lg border bg-card">
+    <div className="rounded-3xl border bg-card">
       <div className="px-4 py-3 border-b">
         <h3 className="text-sm font-medium">{title}</h3>
       </div>
@@ -75,13 +83,44 @@ export default function AnalyticsPage() {
     queryFn: () => apiFetch<{ byCategory: any[]; byPlatform: any[]; detailed: any[] }>(`/api/analytics/error-distribution?range=${range}`),
   })
 
+  // Savings card shows ONE stable monthly figure regardless of the selected
+  // range: the last-30-days data projected to a full month from its actual
+  // span (a young install with 2 days of data shows 15x its 2-day total).
+  // Once 30 days of history exist the real total shows as-is. The hover
+  // hint carries the selected period's actual amount and the projection
+  // basis. Querying 30d separately is free: react-query shares the cache
+  // with the 30d tab.
+  const { data: summary30 } = useQuery({
+    queryKey: ['analytics', 'summary', '30d'],
+    queryFn: () => apiFetch<any>(`/api/analytics/summary?range=30d`),
+  })
+  const actualSavings = summary?.estimatedCostSavings ?? 0
+  const baseSavings = summary30?.estimatedCostSavings ?? 0
+  const spanDays = (() => {
+    if (!summary30?.firstRequestAt) return 30
+    // SQLite stores UTC "YYYY-MM-DD HH:MM:SS"
+    const first = new Date(summary30.firstRequestAt.replace(' ', 'T') + 'Z').getTime()
+    const days = (Date.now() - first) / 86_400_000
+    if (!Number.isFinite(days)) return 30
+    return Math.min(Math.max(days, 1 / 24), 30)
+  })()
+  const extrapolated = spanDays < 29.5
+  const savings30d = extrapolated ? baseSavings * (30 / spanDays) : baseSavings
+  const rangeLabel = range === '24h' ? '24 hours' : range === '7d' ? '7 days' : '30 days'
+  const spanLabel = spanDays >= 2 ? `${Math.round(spanDays)} days` : `${Math.max(1, Math.round(spanDays * 24))} hours`
+  const savingsHint =
+    `You actually saved $${actualSavings.toFixed(2)} over the last ${rangeLabel}. That is what the same tokens would have cost on paid APIs, priced per model. ` +
+    (extrapolated
+      ? `The number shown projects your pace from the last ${spanLabel} of data to a full 30 days.`
+      : `The number shown is your real 30-day total.`)
+
   return (
     <div>
       <PageHeader
         title="Analytics"
         description="Request volume, latency, token usage, and failures."
         actions={
-          <div className="flex gap-1 rounded-md border p-0.5">
+          <div className="flex gap-1 rounded-lg border p-0.5">
             {(['24h', '7d', '30d'] as TimeRange[]).map(r => (
               <Button
                 key={r}
@@ -104,7 +143,11 @@ export default function AnalyticsPage() {
           <Stat label="Input tokens" value={formatTokens(summary?.totalInputTokens)} />
           <Stat label="Output tokens" value={formatTokens(summary?.totalOutputTokens)} />
           <Stat label="Avg latency" value={`${summary?.avgLatencyMs ?? 0} ms`} />
-          <Stat label="Est. savings" value={`$${summary?.estimatedCostSavings ?? '0.00'}`} />
+          {/* Priced per request at the served model's paid-API equivalent
+              rate (not a flat frontier-model rate) — see db/model-pricing.ts.
+              The value is a 30-day projection; the hover hint tells the whole
+              story (actual period amount + whether it was extrapolated). */}
+          <Stat label="Est. savings" value={`$${savings30d.toFixed(2)}`} hint={savingsHint} />
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -175,7 +218,8 @@ export default function AnalyticsPage() {
                         <TableHead className="text-right">Success</TableHead>
                         <TableHead className="text-right">Latency</TableHead>
                         <TableHead className="text-right">In tokens</TableHead>
-                        <TableHead className="text-right pr-4">Out tokens</TableHead>
+                        <TableHead className="text-right">Out tokens</TableHead>
+                        <TableHead className="text-right pr-4">Saved</TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
@@ -187,7 +231,8 @@ export default function AnalyticsPage() {
                           <TableCell className="text-right tabular-nums">{m.successRate}%</TableCell>
                           <TableCell className="text-right tabular-nums">{m.avgLatencyMs} ms</TableCell>
                           <TableCell className="text-right tabular-nums">{formatTokens(m.totalInputTokens)}</TableCell>
-                          <TableCell className="text-right tabular-nums pr-4">{formatTokens(m.totalOutputTokens)}</TableCell>
+                          <TableCell className="text-right tabular-nums">{formatTokens(m.totalOutputTokens)}</TableCell>
+                          <TableCell className="text-right tabular-nums pr-4">${(m.estimatedCost ?? 0).toFixed(2)}</TableCell>
                         </TableRow>
                       ))}
                     </TableBody>
@@ -232,7 +277,7 @@ export default function AnalyticsPage() {
                         <TableCell className="pl-4 text-xs">{e.platform}</TableCell>
                         <TableCell className="text-xs max-w-[200px] truncate">{e.error}</TableCell>
                         <TableCell className="text-right text-xs text-muted-foreground tabular-nums pr-4">
-                          {new Date(e.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          {formatSqliteUtcToLocalTime(e.createdAt, { hour: '2-digit', minute: '2-digit' })}
                         </TableCell>
                       </TableRow>
                     ))}

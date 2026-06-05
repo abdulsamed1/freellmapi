@@ -176,6 +176,71 @@ export function canUseTokens(
   return true;
 }
 
+// ── Provider-wide daily request caps (#162) ──
+// Some providers enforce one daily REQUEST quota across the WHOLE account,
+// shared by every model — not per model. OpenRouter's free tier is the classic
+// case: ~1000 requests/day total (50/day if you've bought <10 credits) no
+// matter how many different free models you spread them across. The
+// per-(platform,model,key) rpd ledger can't see that, so without a provider-wide
+// gate the router happily fires (models × rpd) requests and earns surprise 429s.
+//
+// Defaults below; override per provider with an env var, e.g.
+//   PROVIDER_DAILY_REQUEST_CAP_OPENROUTER=50   (set 0 to disable the cap)
+const DEFAULT_PROVIDER_DAILY_REQUEST_CAPS: Record<string, number> = {
+  openrouter: 1000,
+};
+
+export function getProviderDailyRequestCap(platform: string): number | null {
+  const raw = process.env[`PROVIDER_DAILY_REQUEST_CAP_${platform.toUpperCase()}`];
+  if (raw !== undefined && raw.trim() !== '') {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return n === 0 ? null : n;
+  }
+  return DEFAULT_PROVIDER_DAILY_REQUEST_CAPS[platform] ?? null;
+}
+
+function countPersistedProviderRequests(
+  platform: string,
+  keyId: number,
+  windowMs: number,
+  now: number,
+): number | undefined {
+  return withDb(db => {
+    const row = db.prepare(`
+      SELECT COUNT(*) AS used
+        FROM rate_limit_usage
+       WHERE platform = ?
+         AND key_id = ?
+         AND kind = 'request'
+         AND created_at_ms > ?
+    `).get(platform, keyId, now - windowMs) as { used: number };
+    return row.used;
+  });
+}
+
+// Total requests today for a provider account+key, summed across every model.
+export function providerDailyRequestCount(platform: string, keyId: number, now = Date.now()): number {
+  const persisted = countPersistedProviderRequests(platform, keyId, DAY, now);
+  if (persisted !== undefined) return persisted;
+  // DB-unavailable fallback: sum the per-model rpd windows for this platform+key.
+  // Window key format is "platform:modelId:keyId:rpd" (modelId may contain ':').
+  let total = 0;
+  for (const [key, w] of windows) {
+    if (key.startsWith(`${platform}:`) && key.endsWith(`:${keyId}:rpd`)) {
+      total += pruneTimestamps(w.timestamps, DAY, now).length;
+    }
+  }
+  return total;
+}
+
+// False when this provider account+key has hit its shared daily request cap, so
+// the router skips every model on that provider for this key until UTC-ish reset.
+export function canUseProvider(platform: string, keyId: number, now = Date.now()): boolean {
+  const cap = getProviderDailyRequestCap(platform);
+  if (cap === null) return true;
+  return providerDailyRequestCount(platform, keyId, now) < cap;
+}
+
 export function recordRequest(platform: string, modelId: string, keyId: number) {
   const now = Date.now();
 
@@ -235,6 +300,13 @@ export function getNextCooldownDuration(platform: string, modelId: string, keyId
 
 // Short cooldown for a transient (per-minute) 429 — recovers within ~one window.
 const TRANSIENT_COOLDOWN_MS = 90 * 1000;
+
+// Long cooldown for a 402 Payment Required (provider/key out of credits). Unlike
+// a 429, this won't clear on the next minute/day window — it needs a top-up or
+// billing reset. Bench the model+key for a full day so the router fails over to
+// other providers instead of re-hammering a dead key every retry. Re-escalates
+// on the next 402 after expiry if still unpaid; a restart re-benches on first hit.
+export const PAYMENT_REQUIRED_COOLDOWN_MS = DAY;
 
 // Decide how long to bench a model+key after an upstream 429. Escalate to the
 // long quarantine (getNextCooldownDuration, up to 24h) ONLY when the model is

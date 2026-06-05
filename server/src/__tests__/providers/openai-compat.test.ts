@@ -105,6 +105,21 @@ describe('OpenAICompatProvider', () => {
     ).rejects.toThrow(/Too many requests/);
   });
 
+  it('explains a non-JSON 200 body instead of surfacing the raw parse error (#189)', async () => {
+    // e.g. a custom base URL pointing at Ollama's native NDJSON /api endpoint:
+    // real fetch's res.json() rejects with "Unexpected non-whitespace character
+    // after JSON at position …", which is useless to the user.
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: () => Promise.reject(new SyntaxError('Unexpected non-whitespace character after JSON at position 583 (line 27 column 2)')),
+    } as any);
+
+    await expect(
+      provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')
+    ).rejects.toThrow(/not OpenAI-compatible/);
+  });
+
   it('should validate key using models endpoint', async () => {
     vi.spyOn(global, 'fetch').mockResolvedValueOnce({ ok: true, status: 200 } as any);
     expect(await provider.validateKey('valid')).toBe(true);
@@ -247,6 +262,7 @@ describe('OpenAICompatProvider - platform instances', () => {
     { platform: 'openrouter', name: 'OpenRouter',    baseUrl: 'https://openrouter.ai/api/v1' },
     { platform: 'github',     name: 'GitHub Models', baseUrl: 'https://models.github.ai/inference' },
     { platform: 'zhipu',      name: 'Zhipu AI',      baseUrl: 'https://open.bigmodel.cn/api/paas/v4' },
+    { platform: 'opencode',   name: 'OpenCode Zen',  baseUrl: 'https://opencode.ai/zen/v1' },
   ] as const;
 
   for (const p of platforms) {

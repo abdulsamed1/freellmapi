@@ -114,14 +114,20 @@ register(new OpenAICompatProvider({
   timeoutMs: 120000,
 }));
 
-// Kilo AI Gateway — OpenAI-compatible aggregator. Anonymous access works
-// (200 req/hr per IP) for the few :free routes still active; a Kilo API key
-// raises the limit. Most named "free" routes in the docs have transitioned to
-// paid ("free period ended") — probe before adding catalog rows.
+// Kilo AI Gateway — OpenAI-compatible aggregator. Kilo documents anonymous
+// (keyless) access for `:free` routes, rate-limited 200 req/hr per IP — so this
+// is registered `keyless: true`: the provider omits the Authorization header and
+// the Keys page stores a sentinel row so routing treats it as configured. Free
+// prompts/outputs are logged for training. validateUrl points at the gateway's
+// real model list (`/api/gateway/models`, no `/v1`) which answers GET keyless;
+// the `/v1/models` path only accepts POST (405). Probe before adding catalog
+// rows — most named "free" routes eventually transition to paid.
 register(new OpenAICompatProvider({
   platform: 'kilo',
   name: 'Kilo Gateway',
   baseUrl: 'https://api.kilo.ai/api/gateway/v1',
+  validateUrl: 'https://api.kilo.ai/api/gateway/models',
+  keyless: true,
 }));
 
 // Pollinations — OpenAI-compatible, anonymous tier. The chat completions
@@ -149,6 +155,18 @@ register(new OpenAICompatProvider({
 // Token auth and a custom request/response format. Replaces the standalone
 // memos_proxy.py service — MemOS is now a native FreeLLMAPI provider.
 register(new MemosProvider());
+
+// OpenCode Zen — OpenAI-compatible gateway (https://opencode.ai/zen/v1), same
+// adapter as Groq/OpenRouter. A handful of promotional models are free for a
+// limited time; they need a free account key from https://opencode.ai/auth
+// (no card required — billing only applies to paid models). The free roster is
+// trial-only and prompts/outputs may be used to improve the models, so we seed
+// just the docs-confirmed free IDs (migrateModelsV18) with conservative limits.
+register(new OpenAICompatProvider({
+  platform: 'opencode',
+  name: 'OpenCode Zen',
+  baseUrl: 'https://opencode.ai/zen/v1',
+}));
 
 // Chutes was evaluated for V11 and dropped: probe with a free-tier key
 // returned 402 on every model — "Quota exceeded and account balance is

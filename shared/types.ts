@@ -23,6 +23,9 @@ export type Platform =
   | 'llm7'
   | 'huggingface'
   | 'memos'
+  // OpenCode Zen — OpenAI-compatible gateway. Free promotional models require a
+  // free (no-card) account key from opencode.ai/auth; see migrateModelsV18.
+  | 'opencode'
   // User-configured OpenAI-compatible endpoint (llama.cpp, LM Studio, vLLM,
   // Ollama, any base_url). The endpoint URL lives on the api_keys row; see #117.
   | 'custom';
@@ -43,6 +46,14 @@ export interface Model {
   contextWindow: number | null;
   enabled: boolean;
   supportsVision: boolean;
+  supportsTools: boolean;
+}
+
+export interface ModelListRow {
+  platform: string;
+  model_id: string;
+  display_name: string;
+  context_window: number | null;
 }
 
 export type KeyStatus = 'healthy' | 'rate_limited' | 'invalid' | 'error' | 'unknown';
@@ -114,10 +125,12 @@ export type ChatToolChoice =
   };
 
 // OpenAI's multimodal envelope: clients like opencode / continue.dev send
-// content as an array of typed blocks even for text-only messages. We accept
-// it on the wire and flatten to string for providers that don't support it
-// (Cohere, Cloudflare). See server/src/lib/content.ts.
-export type ChatContentBlock = { type: string; text?: string; [key: string]: unknown };
+// content as an array of typed blocks even for text-only messages, and
+// Gemini-lineage agents (Qwen Code, AionUI) send part-style `{ text }` blocks
+// with no `type` — plus bare strings inside arrays. We accept all of it on
+// the wire and flatten to string for providers that don't support arrays
+// (Cohere, Cloudflare). See server/src/lib/content.ts. (#200)
+export type ChatContentBlock = string | { type?: string; text?: string; [key: string]: unknown };
 export type ChatContent = string | null | ChatContentBlock[];
 
 export interface ChatMessage {

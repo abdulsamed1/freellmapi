@@ -25,6 +25,7 @@ Aggregate the free tiers from Google, Groq, Cerebras, SambaNova, NVIDIA, Mistral
 - [Not yet supported](#not-yet-supported)
 - [Quick start](#quick-start)
 - [Docker](#docker)
+- [Desktop app](#desktop-app)
 - [Using the API](#using-the-api)
 - [Screenshots](#screenshots)
 - [How it works](#how-it-works)
@@ -76,6 +77,7 @@ Plus a **custom** provider — point at any OpenAI-compatible endpoint (llama.cp
 - **Responses API** — `POST /v1/responses` (the wire format current Codex CLI versions require) is implemented as a translating shim over the same router, with full streaming events and tool calls.
 - **Streaming and non-streaming** — Server-Sent Events for `stream: true`, JSON response otherwise. Every provider adapter implements both.
 - **Tool calling** — OpenAI-style `tools` / `tool_choice` requests are passed through, and assistant `tool_calls` + `tool` role follow-up messages round-trip across providers.
+- **Embeddings** — `/v1/embeddings` with family-based routing: failover only ever happens between providers serving the *same* model (vectors from different models are incompatible), never across models. See [Embeddings](#embeddings).
 - **Automatic fallover** — If the chosen provider returns a 429, 5xx, or times out, the router skips it, puts the key on a short cooldown, and retries on the next model in your fallback chain (up to 20 attempts).
 - **Per-key rate tracking** — RPM, RPD, TPM, and TPD counters per `(platform, model, key)` so the router always picks a key that's under its caps.
 - **Sticky sessions** — Multi-turn conversations keep talking to the same model for 30 minutes to avoid the hallucination spike that comes from mid-conversation model switches.
@@ -91,7 +93,6 @@ Plus a **custom** provider — point at any OpenAI-compatible endpoint (llama.cp
 
 The scope is deliberately narrow. If a feature isn't on this list and isn't below, assume it isn't there yet.
 
-- **Embeddings** (`/v1/embeddings`)
 - **Image generation** (`/v1/images/*`)
 - **Audio / speech** (`/v1/audio/*`)
 - **Legacy completions** (`/v1/completions`) — only the chat endpoint is implemented
@@ -148,6 +149,10 @@ npm run dev
 database-stored development key when `DEV_MODE=true` and `NODE_ENV` is not
 `production`; do not use that fallback with real provider keys.
 
+Request analytics are retained for 90 days or 100000 request rows by default,
+whichever limit prunes first. Set `REQUEST_ANALYTICS_RETENTION_DAYS=0` or
+`REQUEST_ANALYTICS_MAX_ROWS=0` in `.env` to disable either retention limit.
+
 Open http://localhost:5173 (the Vite dev UI), add your provider keys on the **Keys** page, reorder the **Fallback Chain** to taste, and grab your unified API key from the **Keys** page header. That unified key is what you point your OpenAI SDK at.
 
 For a production build without Docker:
@@ -179,6 +184,28 @@ By default the container's port is bound to `127.0.0.1` (localhost only). To rea
 SQLite data is stored in the `freellmapi-data` volume at `/app/server/data`. Keep the same `.env` `ENCRYPTION_KEY` and volume when upgrading, because provider keys are encrypted at rest.
 
 More Docker operations and examples live in [docker/README.md](./docker/README.md).
+
+## Desktop app
+
+A native menu-bar app lives in [`desktop/`](./desktop): the entire router +
+dashboard running locally from your tray, with a glass popover showing live
+request stats.
+
+![FreeLLMAPI desktop app](repo-assets/desktop.png)
+
+No published binaries — it builds from this repo in a few minutes:
+
+```bash
+npm install
+npm run desktop:dist        # macOS: desktop/dist-electron/FreeLLMAPI-…-arm64.dmg
+npm run desktop:dist:win    # Windows installer
+```
+
+> **Windows:** the build config is in place but not tested yet — if you try it,
+> a quick report (working or not) in an issue would be much appreciated.
+
+Locally built apps launch without Gatekeeper/SmartScreen warnings — no code
+signing involved. Full instructions in [desktop/README.md](./desktop/README.md).
 
 ## Using the API
 
@@ -290,6 +317,42 @@ Works with `stream=True` as well — you'll get `delta.tool_calls` chunks follow
 
 Every response carries an `X-Routed-Via: <platform>/<model>` header so you can see which provider actually served each call. If a request fell over between providers, you'll also see `X-Fallback-Attempts: N`.
 
+### Embeddings
+
+`/v1/embeddings` is OpenAI-compatible, with one deliberate difference from chat routing: **failover never crosses models.** Vectors from different models live in incompatible spaces — silently switching models would corrupt any vector store built on top of the proxy. So embeddings route by **family** (one model identity + dimension), and failover only walks the providers serving that same family.
+
+```python
+resp = client.embeddings.create(
+    model="auto",          # default family; or a family name like "bge-m3"
+    input=["the quick brown fox", "pack my box with five dozen liquor jugs"],
+)
+print(len(resp.data), "vectors of", len(resp.data[0].embedding), "dims")
+```
+
+```bash
+curl http://localhost:3001/v1/embeddings \
+  -H "Authorization: Bearer freellmapi-your-unified-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "auto", "input": "hello world"}'
+```
+
+`model` accepts `auto` (the configured default family), a family name, or a provider-specific model id (which resolves to its family). Available families:
+
+| Family (`model`) | Dims | Providers (failover order) |
+| --- | --- | --- |
+| `gemini-embedding-001` *(default)* | 3072 | Google |
+| `text-embedding-3-large` | 3072 | GitHub Models |
+| `text-embedding-3-small` | 1536 | GitHub Models |
+| `embed-v4.0` | 1536 | Cohere |
+| `bge-m3` | 1024 | Cloudflare → Hugging Face |
+| `qwen3-embedding-0.6b` | 1024 | Cloudflare |
+| `nv-embedqa-e5-v5` | 1024 | NVIDIA |
+| `llama-nemotron-embed-1b-v2` | 2048 | NVIDIA |
+| `llama-nemotron-embed-vl-1b-v2` | 2048 | NVIDIA → OpenRouter |
+| `embeddinggemma-300m` | 768 | Cloudflare |
+
+The default family, per-provider toggles, and priorities live on the dashboard's **Models → Embeddings** page. Pick your family once and stick with it for a given vector store — that's the whole point of the family model.
+
 ## Screenshots
 
 ### Keys
@@ -356,7 +419,7 @@ Stacking free tiers has real trade-offs. Be honest with yourself about them:
 Contributors very welcome! Good first PRs:
 
 - **Add a provider** — copy `server/src/providers/openai-compat.ts` as a template, wire it into `server/src/providers/index.ts`, seed its models in `server/src/db/index.ts`, add a test in `server/src/__tests__/providers/`.
-- **Add an endpoint** — embeddings, images, moderations. The provider base class can grow new methods; adapters declare which they support.
+- **Add an endpoint** — images, moderations, audio. The provider base class can grow new methods; adapters declare which they support.
 - **Improve the router** — cost-aware routing (cheapest-healthy-fastest tradeoffs), better latency-weighted priority, regional pinning.
 - **Dashboard polish** — charts on the Analytics page, key rotation UX, batch import of keys from `.env`.
 - **Docs** — more examples, client library snippets for Go/Rust/etc., a deployment recipe for Docker or Fly.
@@ -389,6 +452,14 @@ PRs should include a test, keep the existing test suite green, and match the `.e
 <a href="https://github.com/Sumit4codes"><img src="https://images.weserv.nl/?url=github.com/Sumit4codes.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@Sumit4codes" /></a>
 <a href="https://github.com/meliani"><img src="https://images.weserv.nl/?url=github.com/meliani.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@meliani" /></a>
 <a href="https://github.com/thedavidweng"><img src="https://images.weserv.nl/?url=github.com/thedavidweng.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@thedavidweng" /></a>
+<a href="https://github.com/bharvey42"><img src="https://images.weserv.nl/?url=github.com/bharvey42.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@bharvey42" /></a>
+<a href="https://github.com/yuvrxj-afk"><img src="https://images.weserv.nl/?url=github.com/yuvrxj-afk.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@yuvrxj-afk" /></a>
+<a href="https://github.com/Tushar49"><img src="https://images.weserv.nl/?url=github.com/Tushar49.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@Tushar49" /></a>
+<a href="https://github.com/nicyoong"><img src="https://images.weserv.nl/?url=github.com/nicyoong.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@nicyoong" /></a>
+<a href="https://github.com/Aldo-f"><img src="https://images.weserv.nl/?url=github.com/Aldo-f.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@Aldo-f" /></a>
+<a href="https://github.com/Tazrif-Raim"><img src="https://images.weserv.nl/?url=github.com/Tazrif-Raim.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@Tazrif-Raim" /></a>
+<a href="https://github.com/m1nuzz"><img src="https://images.weserv.nl/?url=github.com/m1nuzz.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@m1nuzz" /></a>
+<a href="https://github.com/LoneRifle"><img src="https://images.weserv.nl/?url=github.com/LoneRifle.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@LoneRifle" /></a>
 
 ## Terms of Service review
 
