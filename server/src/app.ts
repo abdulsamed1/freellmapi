@@ -7,6 +7,7 @@ import { keysRouter } from './routes/keys.js';
 import { modelsRouter } from './routes/models.js';
 import { proxyRouter } from './routes/proxy.js';
 import { responsesRouter } from './routes/responses.js';
+import { typesafeRouter } from './routes/typesafe.js';
 import { fallbackRouter } from './routes/fallback.js';
 import { analyticsRouter } from './routes/analytics.js';
 import { healthRouter } from './routes/health.js';
@@ -71,6 +72,8 @@ export function createApp() {
   app.use('/v1', proxyRouter);
   // OpenAI Responses API shim (Codex CLI requires wire_api="responses"; see #96)
   app.use('/v1', responsesRouter);
+  // TypeSafe SystemOne API shim for jevgrep (jg)
+  app.use('/typesafe/v1', typesafeRouter);
 
   // Health check
   app.get('/api/ping', (_req, res) => {

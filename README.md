@@ -74,6 +74,7 @@ Plus a **custom** provider — point at any OpenAI-compatible endpoint (llama.cp
 
 - **OpenAI-compatible** — `POST /v1/chat/completions` and `GET /v1/models` work with the official OpenAI SDKs and any OpenAI-compatible client (LangChain, LlamaIndex, Continue, Hermes, etc.). Just change `base_url`.
 - **Responses API** — `POST /v1/responses` (the wire format current Codex CLI versions require) is implemented as a translating shim over the same router, with full streaming events and tool calls.
+- **TypeSafe SystemOne API** — `POST /typesafe/v1/systemone` bridges semantic code-search tools like `jevgrep` (`jg`) to your free-tier models, evaluating code relevance questions with `noul` scoring across your fallback chain.
 - **Streaming and non-streaming** — Server-Sent Events for `stream: true`, JSON response otherwise. Every provider adapter implements both.
 - **Tool calling** — OpenAI-style `tools` / `tool_choice` requests are passed through, and assistant `tool_calls` + `tool` role follow-up messages round-trip across providers.
 - **Automatic fallover** — If the chosen provider returns a 429, 5xx, or times out, the router skips it, puts the key on a short cooldown, and retries on the next model in your fallback chain (up to 20 attempts).
@@ -289,6 +290,25 @@ If no vision-capable model is enabled in your Fallback Chain, an image request r
 Works with `stream=True` as well — you'll get `delta.tool_calls` chunks followed by a `finish_reason: "tool_calls"` close. Under the hood, OpenAI-compatible providers (Groq, Cerebras, SambaNova, Mistral, OpenRouter, GitHub Models, HuggingFace, Cloudflare, Cohere compat) get the request passed through; Gemini requests get translated into Google's `functionDeclarations` / `functionResponse` shape and the response is translated back.
 
 Every response carries an `X-Routed-Via: <platform>/<model>` header so you can see which provider actually served each call. If a request fell over between providers, you'll also see `X-Fallback-Attempts: N`.
+
+**jevgrep (`jg`) / TypeSafe SystemOne**
+
+`jevgrep` uses the TypeSafe SystemOne API (`POST /typesafe/v1/systemone`) to evaluate code relevance against semantic search questions. Configure `jg` to route through your local proxy using your unified API key:
+
+```bash
+# Point jg at your local FreeLLMAPI instance
+echo "freellmapi-your-unified-key" | jg auth \
+  --provider custom \
+  --base-url http://127.0.0.1:3001/typesafe/v1 \
+  --model default \
+  --stdin
+
+# Verify connection through the synthetic health check
+jg doctor
+
+# Perform semantic search (use --concurrency 1 or 2 to respect free-tier rate limits)
+jg "Where is authentication handled?" ./src --concurrency 1
+```
 
 ## Screenshots
 
