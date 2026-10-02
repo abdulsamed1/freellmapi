@@ -44,6 +44,7 @@ const KEY_MONTHLY_USAGE_FILENAME = '20260914_000001_key_monthly_usage.ts';
 const QUOTA_SNAPSHOT_FRESHNESS_FILENAME = '20260915_000001_quota_snapshot_freshness.ts';
 const MEMOS_MODELS_FILENAME = '20261002_000001_memos_models.ts';
 const MEMOS_NATIVE_OWNERSHIP_FILENAME = '20261002_000002_memos_native_ownership.ts';
+const MEMOS_NATIVE_BASELINE_REPAIR_FILENAME = '20261002_000003_memos_native_baseline_repair.ts';
 
 interface SchemaRow {
   type: string;
@@ -134,6 +135,7 @@ describe('migration round trip', () => {
         QUOTA_SNAPSHOT_FRESHNESS_FILENAME,
         MEMOS_MODELS_FILENAME,
         MEMOS_NATIVE_OWNERSHIP_FILENAME,
+        MEMOS_NATIVE_BASELINE_REPAIR_FILENAME,
       ]);
     } finally {
       db.close();

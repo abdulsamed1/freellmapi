@@ -5,6 +5,7 @@ import {
   up as preserveNative,
   down as restoreNative,
 } from '../../../db/migrations/20261002_000002_memos_native_ownership.js';
+import { up as repairNative } from '../../../db/migrations/20261002_000003_memos_native_baseline_repair.js';
 
 function makeDb(): Database.Database {
   const db = new Database(':memory:');
@@ -197,5 +198,53 @@ describe('MemOS catalog models migration', () => {
       SELECT source FROM models
        WHERE platform = 'memos' AND endpoint_scope = 'custom-endpoint'
     `).get()).toEqual({ source: 'catalog' });
+  });
+
+  it('repairs the broken post-catalog state without touching custom rows', () => {
+    const db = makeDb();
+    dbs.push(db);
+    up(db);
+    preserveNative(db);
+
+    db.prepare(`
+      INSERT INTO models (
+        platform, model_id, display_name, intelligence_rank, speed_rank,
+        key_id, source, endpoint_scope
+      ) VALUES ('memos', 'custom-model', 'Custom model', 1, 1, 7, 'user', 'custom-endpoint')
+    `).run();
+    db.prepare(`
+      DELETE FROM profile_models
+       WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'memos' AND endpoint_scope = '')
+    `).run();
+    db.prepare(`
+      DELETE FROM fallback_config
+       WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'memos' AND endpoint_scope = '')
+    `).run();
+    db.prepare(`
+      DELETE FROM models WHERE platform = 'memos' AND endpoint_scope = ''
+    `).run();
+
+    repairNative(db);
+    repairNative(db);
+
+    expect(db.prepare(`
+      SELECT model_id, display_name, source, key_id, endpoint_scope
+        FROM models WHERE platform = 'memos' ORDER BY model_id
+    `).all()).toEqual([
+      { model_id: 'custom-model', display_name: 'Custom model', source: 'user', key_id: 7, endpoint_scope: 'custom-endpoint' },
+      { model_id: 'deepseek-r1', display_name: 'DeepSeek R1', source: 'builtin', key_id: null, endpoint_scope: '' },
+      { model_id: 'qwen2.5-72b-instruct', display_name: 'Qwen2.5 72B Instruct', source: 'builtin', key_id: null, endpoint_scope: '' },
+      { model_id: 'qwen3-32b', display_name: 'Qwen3 32B', source: 'builtin', key_id: null, endpoint_scope: '' },
+    ]);
+    expect(db.prepare(`
+      SELECT COUNT(*) AS count
+        FROM fallback_config f JOIN models m ON m.id = f.model_db_id
+       WHERE m.platform = 'memos' AND m.source = 'builtin'
+    `).get()).toEqual({ count: 3 });
+    expect(db.prepare(`
+      SELECT COUNT(*) AS count
+        FROM profile_models pm JOIN models m ON m.id = pm.model_db_id
+       WHERE m.platform = 'memos' AND m.source = 'builtin'
+    `).get()).toEqual({ count: 3 });
   });
 });
