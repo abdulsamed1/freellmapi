@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, vi } from 'vitest';
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
 import { getDb, initDb } from '../../db/index.js';
 import { encrypt } from '../../lib/crypto.js';
+import { MemosProvider } from '../../providers/memos.js';
 import { recordRateLimitHit } from '../../services/router.js';
 import { setCooldown } from '../../services/ratelimit.js';
 import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
@@ -48,6 +49,42 @@ describe('Fallback API', () => {
     for (let i = 1; i < body.length; i++) {
       expect(body[i].priority).toBeGreaterThanOrEqual(body[i - 1].priority);
     }
+  });
+
+  it('registers and validates a MemOS key without treating native models as custom', async () => {
+    const validateKey = vi.spyOn(MemosProvider.prototype, 'validateKey').mockResolvedValue(true);
+
+    const added = await request(app, 'POST', '/api/keys', {
+      platform: 'memos',
+      key: 'memos-integration-test-key',
+      label: 'MemOS integration',
+    });
+
+    expect(added.status).toBe(201);
+    expect(added.body.platform).toBe('memos');
+
+    const key = getDb().prepare(`
+      SELECT id, platform FROM api_keys WHERE platform = 'memos' AND label = ?
+    `).get('MemOS integration') as { id: number; platform: string };
+    expect(key.platform).toBe('memos');
+
+    const checked = await request(app, 'POST', `/api/health/check/${key.id}`);
+    expect(checked).toEqual({ status: 200, body: { keyId: key.id, status: 'healthy' } });
+    expect(validateKey).toHaveBeenCalledWith('memos-integration-test-key', expect.anything());
+
+    const fallback = await request(app, 'GET', '/api/fallback');
+    expect(fallback.status).toBe(200);
+    const memosRows = fallback.body.filter((row: any) => row.platform === 'memos');
+    expect(memosRows.map((row: any) => row.modelId)).toEqual([
+      'deepseek-r1',
+      'qwen2.5-72b-instruct',
+      'qwen3-32b',
+    ]);
+    expect(memosRows.every((row: any) => row.source === 'catalog')).toBe(true);
+    expect(fallback.body.some((row: any) => row.platform === 'custom' && memosRows.some((m: any) => m.modelId === row.modelId))).toBe(false);
+
+    const stored = getDb().prepare('SELECT platform, status FROM api_keys WHERE id = ?').get(key.id);
+    expect(stored).toEqual({ platform: 'memos', status: 'healthy' });
   });
 
   it('GET /api/fallback entries have expected fields', async () => {
