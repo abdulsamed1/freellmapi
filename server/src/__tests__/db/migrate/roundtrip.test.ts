@@ -275,8 +275,23 @@ function normalizeGeneratedIds(snapshot: DatabaseSnapshot): DatabaseSnapshot {
       ];
     }),
   );
+  const profileKeysById = new Map(
+    rows.profiles.map(row => {
+      const profile = row as Record<string, unknown>;
+      return [profile.id, `${profile.name}\u0000${profile.type ?? ''}`];
+    }),
+  );
+  const profileModelKeysById = new Map(
+    rows.profile_models.map(row => {
+      const profileModel = row as Record<string, unknown>;
+      return [
+        profileModel.id,
+        `${profileKeysById.get(profileModel.profile_id) ?? `missing-profile:${profileModel.profile_id}`}\u0000${modelKeysById.get(profileModel.model_db_id) ?? `missing-model:${profileModel.model_db_id}`}`,
+      ];
+    }),
+  );
 
-  for (const tableName of ['models', 'fallback_config', 'memos_models_migration_rows']) {
+  for (const tableName of ['models', 'fallback_config', 'profile_models', 'memos_models_migration_rows']) {
     rows[tableName] = rows[tableName].map(row => {
       const normalized = { ...(row as Record<string, unknown>) };
       if (tableName === 'models') {
@@ -285,10 +300,18 @@ function normalizeGeneratedIds(snapshot: DatabaseSnapshot): DatabaseSnapshot {
         normalized.model_db_key = modelKeysById.get(normalized.model_db_id) ?? `missing-model:${normalized.model_db_id}`;
         delete normalized.id;
         delete normalized.model_db_id;
+      } else if (tableName === 'profile_models') {
+        normalized.profile_key = profileKeysById.get(normalized.profile_id) ?? `missing-profile:${normalized.profile_id}`;
+        normalized.model_db_key = modelKeysById.get(normalized.model_db_id) ?? `missing-model:${normalized.model_db_id}`;
+        delete normalized.id;
+        delete normalized.profile_id;
+        delete normalized.model_db_id;
       } else {
         normalized.row_key = normalized.row_type === 'model'
           ? modelKeysById.get(normalized.row_id) ?? `missing-model:${normalized.row_id}`
-          : fallbackKeysById.get(normalized.row_id) ?? `missing-fallback:${normalized.row_id}`;
+          : normalized.row_type === 'fallback'
+            ? fallbackKeysById.get(normalized.row_id) ?? `missing-fallback:${normalized.row_id}`
+            : profileModelKeysById.get(normalized.row_id) ?? `missing-profile-model:${normalized.row_id}`;
         delete normalized.row_id;
       }
       return normalized;
