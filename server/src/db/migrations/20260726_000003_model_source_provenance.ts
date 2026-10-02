@@ -10,7 +10,9 @@
 // silently deleted or clobbered on the next sync as soon as its size_label
 // stopped matching the 'User'/'Custom' convention. `source` records who
 // created the row at insert time:
-//   'catalog' — catalog sync or the bundled baseline migrations
+//   'catalog' — catalog sync
+//   'builtin' — provider-owned bundled baseline (for example native MemOS
+//               models that remain routable when the published catalog omits it)
 //   'user'    — dashboard, custom endpoints, declarative config
 //
 // The column DEFAULT is 'catalog' on purpose: the baseline migration's

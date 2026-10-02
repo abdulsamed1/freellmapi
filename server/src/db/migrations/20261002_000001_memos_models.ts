@@ -25,11 +25,11 @@ export function up(db: Db): void {
       platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
       rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
       enabled, supports_vision, supports_tools, key_id, source, endpoint_scope
-    ) VALUES (?, ?, ?, 50, 50, 'Medium', NULL, NULL, NULL, NULL, '', NULL, 1, 0, 1, NULL, 'catalog', '')
+    ) VALUES (?, ?, ?, 50, 50, 'Medium', NULL, NULL, NULL, NULL, '', NULL, 1, 0, 1, NULL, 'builtin', '')
   `);
   const findModel = db.prepare(`
     SELECT id FROM models
-     WHERE platform = 'memos' AND model_id = ? AND source = 'catalog'
+     WHERE platform = 'memos' AND model_id = ? AND source = 'builtin'
        AND key_id IS NULL AND endpoint_scope = ''
   `);
   const insertFallback = db.prepare(

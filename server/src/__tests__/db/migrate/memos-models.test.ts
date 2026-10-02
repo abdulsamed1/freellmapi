@@ -1,6 +1,10 @@
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 import { up, down } from '../../../db/migrations/20261002_000001_memos_models.js';
+import {
+  up as preserveNative,
+  down as restoreNative,
+} from '../../../db/migrations/20261002_000002_memos_native_ownership.js';
 
 function makeDb(): Database.Database {
   const db = new Database(':memory:');
@@ -61,9 +65,9 @@ describe('MemOS catalog models migration', () => {
              monthly_token_budget, context_window
         FROM models WHERE platform = 'memos' ORDER BY id
     `).all()).toEqual([
-      { model_id: 'deepseek-r1', display_name: 'DeepSeek R1', enabled: 1, supports_vision: 0, supports_tools: 1, key_id: null, source: 'catalog', intelligence_rank: 50, speed_rank: 50, size_label: 'Medium', monthly_token_budget: '', context_window: null },
-      { model_id: 'qwen2.5-72b-instruct', display_name: 'Qwen2.5 72B Instruct', enabled: 1, supports_vision: 0, supports_tools: 1, key_id: null, source: 'catalog', intelligence_rank: 50, speed_rank: 50, size_label: 'Medium', monthly_token_budget: '', context_window: null },
-      { model_id: 'qwen3-32b', display_name: 'Qwen3 32B', enabled: 1, supports_vision: 0, supports_tools: 1, key_id: null, source: 'catalog', intelligence_rank: 50, speed_rank: 50, size_label: 'Medium', monthly_token_budget: '', context_window: null },
+      { model_id: 'deepseek-r1', display_name: 'DeepSeek R1', enabled: 1, supports_vision: 0, supports_tools: 1, key_id: null, source: 'builtin', intelligence_rank: 50, speed_rank: 50, size_label: 'Medium', monthly_token_budget: '', context_window: null },
+      { model_id: 'qwen2.5-72b-instruct', display_name: 'Qwen2.5 72B Instruct', enabled: 1, supports_vision: 0, supports_tools: 1, key_id: null, source: 'builtin', intelligence_rank: 50, speed_rank: 50, size_label: 'Medium', monthly_token_budget: '', context_window: null },
+      { model_id: 'qwen3-32b', display_name: 'Qwen3 32B', enabled: 1, supports_vision: 0, supports_tools: 1, key_id: null, source: 'builtin', intelligence_rank: 50, speed_rank: 50, size_label: 'Medium', monthly_token_budget: '', context_window: null },
     ]);
     expect(db.prepare(`
       SELECT f.priority, f.enabled FROM fallback_config f
@@ -155,5 +159,43 @@ describe('MemOS catalog models migration', () => {
         JOIN models m ON m.id = f.model_db_id
        WHERE m.platform = 'memos'
     `).get()).toEqual({ count: 0 });
+  });
+
+  it('converts existing native rows to builtin ownership and rolls back safely', () => {
+    const db = makeDb();
+    dbs.push(db);
+    up(db);
+    db.prepare(`
+      UPDATE models SET source = 'catalog'
+       WHERE platform = 'memos' AND endpoint_scope = ''
+    `).run();
+    db.prepare(`
+      INSERT INTO models (
+        platform, model_id, display_name, intelligence_rank, speed_rank,
+        key_id, source, endpoint_scope
+      ) VALUES ('memos', 'deepseek-r1', 'Custom endpoint', 1, 1, NULL, 'catalog', 'custom-endpoint')
+    `).run();
+
+    preserveNative(db);
+    expect(db.prepare(`
+      SELECT source FROM models
+       WHERE platform = 'memos' AND endpoint_scope = ''
+       AND model_id = 'deepseek-r1'
+    `).get()).toEqual({ source: 'builtin' });
+    expect(db.prepare(`
+      SELECT source FROM models
+       WHERE platform = 'memos' AND endpoint_scope = 'custom-endpoint'
+    `).get()).toEqual({ source: 'catalog' });
+
+    restoreNative(db);
+    expect(db.prepare(`
+      SELECT source FROM models
+       WHERE platform = 'memos' AND endpoint_scope = ''
+       AND model_id = 'deepseek-r1'
+    `).get()).toEqual({ source: 'catalog' });
+    expect(db.prepare(`
+      SELECT source FROM models
+       WHERE platform = 'memos' AND endpoint_scope = 'custom-endpoint'
+    `).get()).toEqual({ source: 'catalog' });
   });
 });

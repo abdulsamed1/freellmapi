@@ -115,6 +115,45 @@ describe('applyCatalog', () => {
     expect(fb).toBeTruthy();
   });
 
+  it('preserves native MemOS models when a catalog omits the provider', () => {
+    const db = getDb();
+    db.prepare(`
+      INSERT INTO models (
+        platform, model_id, display_name, intelligence_rank, speed_rank,
+        size_label, source, endpoint_scope
+      ) VALUES ('groq', 'catalog-only-row', 'Catalog Only', 1, 1, 'Medium', 'catalog', '')
+    `).run();
+    const before = db.prepare(`
+      SELECT model_id FROM models WHERE platform = 'memos' ORDER BY model_id
+    `).all();
+
+    applyCatalog(db, catalogOf(existingAsCatalogModels().filter((m) =>
+      m.platform !== 'memos' && m.modelId !== 'catalog-only-row',
+    )));
+
+    expect(db.prepare(`
+      SELECT model_id, source FROM models WHERE platform = 'memos' ORDER BY model_id
+    `).all()).toEqual([
+      { model_id: 'deepseek-r1', source: 'builtin' },
+      { model_id: 'qwen2.5-72b-instruct', source: 'builtin' },
+      { model_id: 'qwen3-32b', source: 'builtin' },
+    ]);
+    expect(db.prepare(`
+      SELECT m.model_id
+        FROM profile_models pm JOIN models m ON m.id = pm.model_db_id
+       WHERE m.platform = 'memos'
+       ORDER BY m.model_id
+    `).all()).toEqual(before);
+    expect(db.prepare(`
+      SELECT 1 FROM models WHERE platform = 'groq' AND model_id = 'catalog-only-row'
+    `).get()).toBeUndefined();
+    expect(db.prepare(`
+      SELECT COUNT(*) AS count
+        FROM fallback_config f JOIN models m ON m.id = f.model_db_id
+       WHERE m.platform = 'memos'
+    `).get()).toEqual({ count: 3 });
+  });
+
   it('caps GitHub GPT-4.1 catalog context at the routable free-tier limit (#426)', () => {
     const models = existingAsCatalogModels();
     const target = models.find((m) => m.platform === 'github' && m.modelId === 'openai/gpt-4.1');
