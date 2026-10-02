@@ -92,6 +92,7 @@ export const PLATFORMS: { value: Platform; label: string; url: string; keyless?:
   { value: 'volcengine', label: 'Volcengine Ark (free daily, needs cn real-name)', url: 'https://console.volcengine.com/ark' },
   { value: 'longcat', label: 'LongCat (free daily, email signup ok)', url: 'https://longcat.chat/platform' },
   { value: 'xfyun', label: 'iFlytek Spark (free Lite, needs cn real-name)', url: 'https://console.xfyun.cn' },
+  { value: 'memos', label: 'MemOS', url: 'https://memos.memtensor.cn' },
 ]
 
 // 'custom' is configured through its own form (base URL + model), not the

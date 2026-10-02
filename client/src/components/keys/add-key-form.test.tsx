@@ -7,6 +7,7 @@ import { I18nProvider } from '@/i18n'
 import { apiFetch } from '@/lib/api'
 import type { Platform } from '../../../../shared/types'
 import { AddKeyForm } from './add-key-form'
+import { PLATFORMS } from './shared'
 
 vi.mock('@/lib/api', () => ({ apiFetch: vi.fn() }))
 vi.mock('@/lib/toast', () => ({ toast: { success: vi.fn(), error: vi.fn(), info: vi.fn() } }))
@@ -79,4 +80,11 @@ it('still requires a key for a provider that needs one', async () => {
   mount(<AddKeyForm onSuccess={onSuccess} initialPlatform="groq" />)
   await submit()
   expect(posted()).toBeUndefined()
+})
+
+it('lists MemOS in the provider registry', () => {
+  expect(PLATFORMS.find(provider => provider.value === 'memos')).toMatchObject({
+    label: 'MemOS',
+    url: 'https://memos.memtensor.cn',
+  })
 })
