@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   DndContext,
@@ -13,213 +13,157 @@ import {
   arrayMove,
   SortableContext,
   sortableKeyboardCoordinates,
-  useSortable,
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable'
-import { CSS } from '@dnd-kit/utilities'
+import { Boxes, ChevronDown, Search, X } from 'lucide-react'
+import { Link, useNavigate } from 'react-router-dom'
+import { useI18n } from '@/i18n'
 import { apiFetch } from '@/lib/api'
+import {
+  buildGroups,
+  clampRankToIndex,
+  isGroupDepleted,
+  groupMatchesQuery,
+  groupMaxContext,
+  type FallbackEntry,
+  type ModelGroupRow,
+  type RateLimitUsageData,
+  type RoutingData,
+  type RoutingStrategy,
+  type RoutingWeights,
+  type KeySelectionStrategy,
+  type Row,
+  type TokenUsageData,
+} from '@/lib/routing'
 import { Button } from '@/components/ui/button'
-import { Switch } from '@/components/ui/switch'
+import { CustomWeightsPopover } from '@/components/custom-weights-popover'
+import { EmptyState } from '@/components/empty-state'
+import { GettingStarted } from '@/components/getting-started'
+import { GroupHeaderCells, ModelTableHead, SortableGroupRow } from '@/components/model-table'
+import { TableSkeleton } from '@/components/ui/skeleton'
+import { TokenUsageBar } from '@/components/token-usage-bar'
 import { PageHeader } from '@/components/page-header'
+import { FloatingBar } from '@/components/floating-bar'
+import { ModelsTabs } from '@/components/models-tabs'
+import { Tooltip } from '@/components/tooltip'
+import { PenaltyInspector } from '@/components/penalty-inspector'
+import { PeakHoursControls } from '@/components/peak-hours-controls'
+import { ChainManager } from '@/components/chain-manager'
 
-interface FallbackEntry {
-  modelDbId: number
-  priority: number
-  effectivePriority: number
-  penalty: number
-  rateLimitHits: number
-  enabled: boolean
-  platform: string
-  modelId: string
-  displayName: string
-  intelligenceRank: number
-  speedRank: number
-  sizeLabel: string
-  rpmLimit: number | null
-  rpdLimit: number | null
-  monthlyTokenBudget: string
-  supportsVision: boolean
-  keyCount: number
-}
+// `tKey` is the i18n suffix under `strategies.*` (label) and `strategies.*Blurb`.
+// It differs from the routing `key` for Manual, whose strategy id is 'priority'.
+const STRATEGIES: { key: RoutingStrategy; tKey: string }[] = [
+  { key: 'priority', tKey: 'manual' },
+  { key: 'balanced', tKey: 'balanced' },
+  { key: 'smartest', tKey: 'smartest' },
+  { key: 'fastest', tKey: 'fastest' },
+  { key: 'reliable', tKey: 'reliable' },
+  { key: 'custom', tKey: 'custom' },
+]
 
-function formatTokens(n: number): string {
-  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
-  return String(n)
-}
+// Minimum-context filter buckets for the Models page toolbar. `key` is the token
+// threshold (0 = no filter); numeric labels are not localized (they're numbers).
+const CTX_BUCKETS: { key: number; label?: string; tKey?: string }[] = [
+  { key: 0, tKey: 'ctxAny' },
+  { key: 32_000, label: '32K+' },
+  { key: 128_000, label: '128K+' },
+  { key: 1_000_000, label: '1M+' },
+]
 
-interface TokenUsageData {
-  totalBudget: number
-  totalUsed: number
-  models: { displayName: string; platform: string; budget: number }[]
-}
+// Rows rendered up front; a sentinel below the table streams in the rest as
+// you scroll. Keeps first paint cheap when the catalog grows into the
+// hundreds without a virtualization dependency (which would fight dnd-kit).
+const RENDER_CHUNK = 50
 
-const platformColors: Record<string, string> = {
-  google:      '#4285f4',
-  groq:        '#f55036',
-  cerebras:    '#8b5cf6',
-  sambanova:   '#14b8a6',
-  nvidia:      '#76b900',
-  mistral:     '#f59e0b',
-  openrouter:  '#ec4899',
-  github:      '#6e7b8b',
-  cohere:      '#d946ef',
-  cloudflare:  '#f38020',
-  zhipu:       '#06b6d4',
-  ollama:      '#000000',
-  kilo:        '#7c3aed',
-  pollinations: '#a855f7',
-  llm7:        '#0ea5e9',
-  huggingface: '#ff9d00',
-}
+// The secondary routing knobs (key selection, exploration, peak hours) live
+// behind a "More options" disclosure so the card opens on the strategy pills
+// alone. Collapse state is remembered per browser, the same way the chain
+// manager and the penalty inspector below remember theirs; a fresh install
+// (no stored value) starts collapsed.
+const OPTIONS_COLLAPSED_KEY = 'freellmapi.routingMoreOptions.collapsed'
 
-function TokenUsageBar({ data }: { data: TokenUsageData }) {
-  const { totalBudget, totalUsed, models } = data
-  const remaining = Math.max(0, totalBudget - totalUsed)
-  const remainingPct = totalBudget > 0 ? Math.round((remaining / totalBudget) * 100) : 0
-
-  // Scale each model's segment proportionally so the colored portion of the
-  // bar sums to `remaining`; the grey tail represents what's been used.
-  const modelsWithWidth = models.map(m => ({
-    ...m,
-    remainingTokens: totalBudget > 0 ? (m.budget / totalBudget) * remaining : 0,
-    widthPct: totalBudget > 0 ? (m.budget / totalBudget) * (remaining / totalBudget) * 100 : 0,
-  }))
-  const usedPct = totalBudget > 0 ? (totalUsed / totalBudget) * 100 : 0
-
-  return (
-    <section className="rounded-lg border bg-card p-5">
-      <div className="flex items-baseline justify-between mb-3">
-        <h2 className="text-sm font-medium">Monthly token budget</h2>
-        <span className="text-xs text-muted-foreground tabular-nums">
-          <span className="text-foreground font-medium">{formatTokens(remaining)}</span> remaining
-          <span className="mx-1.5">·</span>
-          {remainingPct}% of {formatTokens(totalBudget)}
-        </span>
-      </div>
-
-      <div className="flex h-2.5 rounded-full overflow-hidden bg-muted">
-        {modelsWithWidth.map((m, i) => (
-          <div
-            key={i}
-            title={`${m.displayName} (${m.platform}) — ${formatTokens(m.remainingTokens)} remaining`}
-            style={{
-              width: `${m.widthPct}%`,
-              backgroundColor: platformColors[m.platform] ?? '#94a3b8',
-            }}
-          />
-        ))}
-        {totalUsed > 0 && (
-          <div
-            title={`Used — ${formatTokens(totalUsed)}`}
-            className="bg-muted-foreground/30"
-            style={{ width: `${usedPct}%` }}
-          />
-        )}
-      </div>
-
-      <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-5 gap-y-1.5 text-xs tabular-nums">
-        {modelsWithWidth.map((m, i) => (
-          <div key={i} className="flex items-center gap-2 min-w-0">
-            <span
-              className="size-2 rounded-sm flex-shrink-0"
-              style={{ backgroundColor: platformColors[m.platform] ?? '#94a3b8' }}
-            />
-            <span className="truncate">{m.displayName}</span>
-            <span className="flex-1" />
-            <span className="font-mono text-muted-foreground">{formatTokens(m.remainingTokens)}</span>
-          </div>
-        ))}
-      </div>
-    </section>
-  )
-}
-
-function SortableModelRow({
-  entry,
-  index,
-  onToggle,
-}: {
-  entry: FallbackEntry
-  index: number
-  onToggle: (modelDbId: number, enabled: boolean) => void
-}) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
-    id: entry.modelDbId,
-  })
-
-  const style = {
-    transform: CSS.Transform.toString(transform),
-    transition,
+function readOptionsCollapsed(): boolean {
+  try {
+    const stored = localStorage.getItem(OPTIONS_COLLAPSED_KEY)
+    return stored === null ? true : stored === '1'
+  } catch {
+    return true
   }
-
-  return (
-    <div
-      ref={setNodeRef}
-      style={style}
-      className={`group flex items-center gap-3 px-4 py-3 bg-card ${isDragging ? 'opacity-50' : ''} ${entry.enabled ? '' : 'opacity-50'}`}
-    >
-      <button
-        {...attributes}
-        {...listeners}
-        className="cursor-grab active:cursor-grabbing text-muted-foreground/50 hover:text-foreground transition-colors"
-        aria-label="Drag to reorder"
-      >
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-          <circle cx="9" cy="6" r="1.5" /><circle cx="15" cy="6" r="1.5" />
-          <circle cx="9" cy="12" r="1.5" /><circle cx="15" cy="12" r="1.5" />
-          <circle cx="9" cy="18" r="1.5" /><circle cx="15" cy="18" r="1.5" />
-        </svg>
-      </button>
-      <span className="text-xs font-mono text-muted-foreground w-5 tabular-nums">{index + 1}</span>
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className="font-medium text-sm">{entry.displayName}</span>
-          <span className="text-xs text-muted-foreground">{entry.platform}</span>
-          {entry.supportsVision && (
-            <span
-              title="Accepts image input"
-              className="text-xs rounded-full px-2 py-0.5 bg-cyan-600/15 text-cyan-700 dark:bg-cyan-400/15 dark:text-cyan-400"
-            >
-              Vision
-            </span>
-          )}
-          {entry.penalty > 0 && (
-            <span className="text-xs text-amber-600 dark:text-amber-400">
-              −{entry.penalty} penalty
-            </span>
-          )}
-        </div>
-        <div className="flex gap-3 mt-0.5 text-xs text-muted-foreground tabular-nums">
-          <span>Intel #{entry.intelligenceRank}</span>
-          <span>Speed #{entry.speedRank}</span>
-          {entry.rpmLimit && <span>{entry.rpmLimit} rpm</span>}
-          {entry.rpdLimit && <span>{entry.rpdLimit} rpd</span>}
-          <span>{entry.monthlyTokenBudget} tok/mo</span>
-        </div>
-      </div>
-      <Switch
-        checked={entry.enabled}
-        onCheckedChange={(checked) => onToggle(entry.modelDbId, checked)}
-      />
-    </div>
-  )
 }
+
 
 export default function FallbackPage() {
+  const { t } = useI18n()
+  const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const [localEntries, setLocalEntries] = useState<FallbackEntry[] | null>(null)
+  // Staged edits carry the chain they were made against, so switching chains
+  // in the manager below discards them instead of letting one chain's unsaved
+  // rows be saved into another (#1021).
+  const [staged, setStaged] = useState<{ profileId: number | null; entries: FallbackEntry[] } | null>(null)
+  const [optionsCollapsed, setOptionsCollapsed] = useState(readOptionsCollapsed)
 
-  const { data: entries = [], isLoading } = useQuery<FallbackEntry[]>({
-    queryKey: ['fallback'],
-    queryFn: () => apiFetch('/api/fallback'),
+  // Catalog search + filter state (#343).
+  const [search, setSearch] = useState('')
+  const [filterVision, setFilterVision] = useState(false)
+  const [filterTools, setFilterTools] = useState(false)
+  const [minContext, setMinContext] = useState(0)
+
+  // The table edits the ACTIVE chain, so it is part of this query's identity
+  // (#1021): keyed on 'fallback' alone, switching chains in the manager below
+  // re-rendered the previous chain's rows from cache, and a save then wrote
+  // them into the newly activated one. Held back until the active chain is
+  // known so the first paint is already the right chain's.
+  const { data: active, isPending: activePending } = useQuery<{ activeProfileId: number | null }>({
+    queryKey: ['profiles', 'active'],
+    queryFn: () => apiFetch('/api/profiles/active'),
   })
+  const activeProfileId = active?.activeProfileId ?? null
+
+  const { data: entries = [], isLoading: entriesLoading } = useQuery<FallbackEntry[]>({
+    queryKey: ['fallback', 'chain', activeProfileId],
+    // The chain id rides in the request itself (#1047): keyed-but-unpinned, a
+    // refetch racing an activation fetched "whichever chain is active by now"
+    // into the OLD chain's cache entry, and switching A→B→A then rendered (and
+    // could save) B's rows under A's name until a hard refresh.
+    queryFn: () => apiFetch(activeProfileId != null ? `/api/fallback?profile=${activeProfileId}` : '/api/fallback'),
+    enabled: !activePending,
+  })
+  const isLoading = activePending || entriesLoading
+
+  // Staged edits are DISCARDED when the active chain changes, not just hidden
+  // (#1047): merely masking them meant switching A→B→A resurrected A's stale
+  // unsaved rows over freshly fetched data, with only a refresh clearing them.
+  useEffect(() => {
+    setStaged(prev => (prev && prev.profileId !== activeProfileId ? null : prev))
+  }, [activeProfileId])
+
+  const localEntries = staged && staged.profileId === activeProfileId ? staged.entries : null
+  const setLocalEntries = (entries: FallbackEntry[] | null) =>
+    setStaged(entries === null ? null : { profileId: activeProfileId, entries })
 
   const { data: tokenUsage } = useQuery<TokenUsageData>({
     queryKey: ['fallback', 'token-usage'],
     queryFn: () => apiFetch('/api/fallback/token-usage'),
   })
+
+  const { data: routing } = useQuery<RoutingData>({
+    queryKey: ['fallback', 'routing'],
+    queryFn: () => apiFetch('/api/fallback/routing'),
+    refetchInterval: 15_000,
+  })
+
+  // Time-window rate-limit usage (#876). One observer and one poll timer for the
+  // whole table — the row component reads it from a map instead of subscribing
+  // per row, which on a large catalog was hundreds of observers and timers.
+  const { data: rateLimitUsage } = useQuery<RateLimitUsageData>({
+    queryKey: ['fallback', 'rate-limit-usage'],
+    queryFn: () => apiFetch('/api/fallback/rate-limit-usage'),
+    refetchInterval: 15_000,
+  })
+  const rateUsageByModel = useMemo(
+    () => new Map((rateLimitUsage?.rows ?? []).map(r => [r.modelDbId, r])),
+    [rateLimitUsage],
+  )
 
   const saveMutation = useMutation({
     mutationFn: (data: { modelDbId: number; priority: number; enabled: boolean }[]) =>
@@ -230,130 +174,487 @@ export default function FallbackPage() {
     },
   })
 
-  const sortMutation = useMutation({
-    mutationFn: (preset: string) =>
-      apiFetch(`/api/fallback/sort/${preset}`, { method: 'POST' }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
-      setLocalEntries(null)
-    },
+  const strategyMutation = useMutation({
+    mutationFn: (payload: {
+      strategy: RoutingStrategy; weights?: RoutingWeights; exploreEnabled?: boolean
+      peakHoursAdjust?: boolean; peakStartHour?: number; peakEndHour?: number; peakTimezone?: string
+      keySelectionStrategy?: KeySelectionStrategy; cooldownCeilingMs?: number | null
+    }) =>
+      apiFetch('/api/fallback/routing', { method: 'PUT', body: JSON.stringify(payload) }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['fallback', 'routing'] }),
   })
 
-  const allEntries = localEntries ?? entries
-  const displayEntries = allEntries.filter(e => e.keyCount > 0)
-  const unconfiguredPlatforms = [...new Set(allEntries.filter(e => e.keyCount === 0).map(e => e.platform))]
+  const strategy: RoutingStrategy = routing?.strategy ?? 'balanced'
+  const keySelection: KeySelectionStrategy = routing?.keySelectionStrategy ?? 'auto'
+  const isManual = strategy === 'priority'
+
+  // Merge fallback metadata with live scores, keyed by model. Memoized (#1047):
+  // recomputing these over the whole catalog on every render — and the page
+  // renders once per landing query plus once per 15s poll — was a large part of
+  // the "absurdly slow" feel on big catalogs.
+  const scoreById = useMemo(
+    () => new Map((routing?.scores ?? []).map(s => [s.modelDbId, s])),
+    [routing?.scores],
+  )
+  const allEntries = useMemo(() => localEntries ?? entries, [localEntries, entries])
+  const configured = useMemo(() => allEntries.filter(e => e.keyCount > 0), [allEntries])
+  const unconfiguredPlatforms = useMemo(
+    () => [...new Set(allEntries.filter(e => e.keyCount === 0).map(e => e.platform))],
+    [allEntries],
+  )
+
+  // Entry fields win on overlap: the routing snapshot also carries `enabled`
+  // (and identity fields), which would otherwise clobber unsaved local toggles.
+  const rows: Row[] = useMemo(
+    () => configured.map(e => ({ ...(scoreById.get(e.modelDbId) ?? {}), ...e })),
+    [configured, scoreById],
+  )
 
   const sensors = useSensors(
     useSensor(PointerSensor),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   )
 
-  function handleDragEnd(event: DragEndEvent) {
-    const { active, over } = event
-    if (!over || active.id === over.id) return
-    const oldIndex = displayEntries.findIndex(e => e.modelDbId === active.id)
-    const newIndex = displayEntries.findIndex(e => e.modelDbId === over.id)
-    const reorderedVisible = arrayMove(displayEntries, oldIndex, newIndex)
-    const unconfigured = allEntries.filter(e => e.keyCount === 0)
-    const merged = [
-      ...reorderedVisible.map((e, i) => ({ ...e, priority: i + 1 })),
-      ...unconfigured.map((e, i) => ({ ...e, priority: reorderedVisible.length + i + 1 })),
-    ]
-    setLocalEntries(merged)
-  }
-
-  function handleToggle(modelDbId: number, enabled: boolean) {
-    const updated = allEntries.map(e =>
-      e.modelDbId === modelDbId ? { ...e, enabled } : e
-    )
-    setLocalEntries(updated)
-  }
-
   function handleSave() {
-    if (!localEntries) return
-    saveMutation.mutate(
-      allEntries.map(e => ({
-        modelDbId: e.modelDbId,
-        priority: e.priority,
-        enabled: e.enabled,
-      }))
-    )
+    saveMutation.mutate(allEntries.map(e => ({ modelDbId: e.modelDbId, priority: e.priority, enabled: e.enabled })))
+  }
+
+  function toggleOptions() {
+    setOptionsCollapsed(prev => {
+      const next = !prev
+      try { localStorage.setItem(OPTIONS_COLLAPSED_KEY, next ? '1' : '0') } catch { /* ignore */ }
+      return next
+    })
   }
 
   const hasChanges = localEntries !== null
 
+  // ── Model unification: a model served by several providers is always shown as
+  // one logical row that links to its own page (the on/off toggle was removed). ─
+  const orderedGroups = useMemo(() => buildGroups(rows, isManual, rateUsageByModel), [rows, isManual, rateUsageByModel])
+
+  // Catalog search + filters (#343). Filtering operates on whole logical-model
+  // groups; rank stays the model's position in the full chain so the numbers
+  // don't renumber as you filter. Drag-to-reorder is only offered over the full,
+  // unfiltered manual chain (reordering a filtered subset would be ambiguous).
+  const rankByKey = useMemo(() => new Map(orderedGroups.map((g, i) => [g.key, i + 1])), [orderedGroups])
+  const query = search.trim().toLowerCase()
+  const filtersActive = query !== '' || filterVision || filterTools || minContext > 0
+  const visibleGroups = useMemo(() => orderedGroups.filter(g => {
+    if (filterVision && !g.members.some(m => m.supportsVision)) return false
+    if (filterTools && !g.members.some(m => m.supportsTools)) return false
+    if (minContext > 0 && groupMaxContext(g.members) < minContext) return false
+    if (query && !groupMatchesQuery(g, query)) return false
+    return true
+  }), [orderedGroups, filterVision, filterTools, minContext, query])
+  const draggable = isManual && !filtersActive
+
+  // Progressive rendering: grow the row budget whenever the sentinel below the
+  // table scrolls near the viewport (drag autoscroll extends it too).
+  const [renderLimit, setRenderLimit] = useState(RENDER_CHUNK)
+  const renderedGroups = visibleGroups.slice(0, renderLimit)
+  const hasMoreRows = visibleGroups.length > renderLimit
+  const sentinelRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!hasMoreRows) return
+    const el = sentinelRef.current
+    if (!el) return
+    const io = new IntersectionObserver(
+      hits => {
+        if (hits.some(h => h.isIntersecting)) setRenderLimit(l => l + RENDER_CHUNK)
+      },
+      { rootMargin: '600px' },
+    )
+    io.observe(el)
+    return () => io.disconnect()
+  }, [hasMoreRows, renderLimit])
+
+  function clearFilters() {
+    setSearch('')
+    setFilterVision(false)
+    setFilterTools(false)
+    setMinContext(0)
+  }
+
+  function handleGroupToggle(memberIds: number[], enabled: boolean) {
+    const ids = new Set(memberIds)
+    setLocalEntries(allEntries.map(e => (ids.has(e.modelDbId) ? { ...e, enabled } : e)))
+  }
+
+  // Bulk on/off over what is currently on screen (#895). Curating a chain by
+  // hand means turning most of the catalog off, which one row at a time over
+  // 200 models nobody does. It deliberately follows the filters: "search groq,
+  // disable all" is the useful gesture, and touching hidden rows would be a
+  // surprise. Like every other edit here it stages into localEntries and waits
+  // for Save.
+  const visibleMemberIds = visibleGroups.flatMap(g => g.members.map(m => m.modelDbId))
+  const visibleEnabledCount = visibleGroups.filter(g => g.members.some(m => m.enabled)).length
+
+  function handleBulkToggle(enabled: boolean) {
+    const ids = new Set(visibleMemberIds)
+    setLocalEntries(allEntries.map(e => (ids.has(e.modelDbId) ? { ...e, enabled } : e)))
+  }
+
+  // Serialize the displayed group order (group-major, member-minor) to the flat
+  // priority list PUT /api/fallback expects; keyless rows keep their tail spot.
+  function persistGroupOrder(groups: ModelGroupRow[]) {
+    const order: number[] = []
+    for (const g of groups) for (const m of g.members) order.push(m.modelDbId)
+    const unconfigured = allEntries.filter(e => e.keyCount === 0).map(e => e.modelDbId)
+    const prio = new Map([...order, ...unconfigured].map((id, i) => [id, i + 1]))
+    setLocalEntries(allEntries.map(e => ({ ...e, priority: prio.get(e.modelDbId) ?? e.priority })))
+  }
+
+  // Jump-to-rank (#1317): type a target rank instead of dragging a model across
+  // a long chain. Same staging path as drag — persistGroupOrder serializes the
+  // new display order into localEntries and Save commits it. The typed rank is
+  // clamped to the chain, so 1 means "front of the queue" and an over-the-end
+  // number means "last" without needing a validation error.
+  function handleMoveGroupRank(key: string, toRank: number) {
+    const oldI = orderedGroups.findIndex(g => g.key === key)
+    if (oldI < 0) return
+    const newI = clampRankToIndex(toRank, orderedGroups.length)
+    if (newI === oldI) return
+    persistGroupOrder(arrayMove(orderedGroups, oldI, newI))
+  }
+
+  // Reorder models (the failover priority order). Providers within a model are
+  // ordered by the active strategy and managed on the model's own page.
+  function handleGroupedDragEnd(event: DragEndEvent) {
+    const { active, over } = event
+    if (!over || active.id === over.id) return
+    const oldI = orderedGroups.findIndex(g => `grp:${g.key}` === String(active.id))
+    const newI = orderedGroups.findIndex(g => `grp:${g.key}` === String(over.id))
+    if (oldI < 0 || newI < 0) return
+    persistGroupOrder(arrayMove(orderedGroups, oldI, newI))
+  }
+
   return (
     <div>
       <PageHeader
-        title="Fallback chain"
-        description="Drag to reorder. Requests try models top-to-bottom until one succeeds."
-        actions={
-          <>
-            <Button variant="outline" size="sm" onClick={() => sortMutation.mutate('intelligence')} disabled={sortMutation.isPending}>
-              Sort by intelligence
-            </Button>
-            <Button variant="outline" size="sm" onClick={() => sortMutation.mutate('speed')} disabled={sortMutation.isPending}>
-              Sort by speed
-            </Button>
-            <Button variant="outline" size="sm" onClick={() => sortMutation.mutate('budget')} disabled={sortMutation.isPending}>
-              Sort by budget
-            </Button>
-          </>
-        }
+        title={t('models.title')}
+        description={t('strategies.description')}
+        divider={false}
+        actions={<ModelsTabs />}
       />
 
       <div className="space-y-6">
-        {tokenUsage && tokenUsage.totalBudget > 0 && (
-          <TokenUsageBar data={tokenUsage} />
-        )}
+        {/* First-run checklist: hides itself once the install has keys + a request */}
+        <GettingStarted />
 
-        {isLoading ? (
-          <p className="text-sm text-muted-foreground">Loading…</p>
-        ) : displayEntries.length === 0 ? (
-          <div className="rounded-lg border border-dashed p-8 text-center">
-            <p className="text-sm text-muted-foreground">
-              No models available. Add API keys on the <a href="/keys" className="underline text-foreground">Keys page</a> first.
-            </p>
+        {/* Monthly token budget — moved to the top */}
+        {tokenUsage && tokenUsage.totalBudget > 0 && <TokenUsageBar data={tokenUsage} />}
+
+        {/* Strategy selector */}
+        <section className="rounded-3xl border bg-card p-5">
+          <div className="flex items-baseline justify-between mb-3">
+            <h2 className="text-sm font-medium">{t('strategies.title')}</h2>
+            {routing?.weights && (
+              <span className="text-xs text-muted-foreground tabular-nums">
+                {t('strategies.weightsSummary', {
+                  reliability: Math.round(routing.weights.reliability * 100),
+                  speed: Math.round(routing.weights.speed * 100),
+                  intelligence: Math.round(routing.weights.intelligence * 100),
+                })}
+                {/* These numbers are not the preset's while the peak-hours
+                    adjustment is firing, so say so right where they are read. */}
+                {routing.peakAdjusted && (
+                  <Tooltip text={t('strategies.peakActiveHint')}>
+                    <span className="ml-1 cursor-help underline decoration-dotted underline-offset-2">
+                      {t('strategies.peakActive')}
+                    </span>
+                  </Tooltip>
+                )}
+              </span>
+            )}
           </div>
-        ) : (
-          <>
-            <div className="rounded-lg border divide-y overflow-hidden">
-              <DndContext
-                sensors={sensors}
-                collisionDetection={closestCenter}
-                onDragEnd={handleDragEnd}
-              >
-                <SortableContext
-                  items={displayEntries.map(e => e.modelDbId)}
-                  strategy={verticalListSortingStrategy}
-                >
-                  {displayEntries.map((entry, index) => (
-                    <SortableModelRow
-                      key={entry.modelDbId}
-                      entry={entry}
-                      index={index}
-                      onToggle={handleToggle}
-                    />
-                  ))}
-                </SortableContext>
-              </DndContext>
+
+          {/* Pills left, the quiet "More options" disclosure right. Everything
+              secondary hangs off that toggle so the card reads as one choice. */}
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="inline-flex flex-wrap items-center gap-1 rounded-xl border p-1">
+              {STRATEGIES.map(s => (
+                <Tooltip key={s.key} text={t(`strategies.${s.tKey}Blurb`)}>
+                  <button
+                    disabled={strategyMutation.isPending}
+                    onClick={() => strategyMutation.mutate({ strategy: s.key })}
+                    className={`px-3 py-1.5 text-xs rounded-lg transition-colors ${
+                      s.key === strategy
+                        ? 'bg-foreground text-background font-medium'
+                        : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                    }`}
+                  >
+                    {t(`strategies.${s.tKey}`)}
+                  </button>
+                </Tooltip>
+              ))}
+              {strategy === 'custom' && routing && (
+                <CustomWeightsPopover
+                  saved={routing.customWeights}
+                  saving={strategyMutation.isPending}
+                  onSave={w => strategyMutation.mutate({ strategy: 'custom', weights: w })}
+                />
+              )}
             </div>
 
-            {hasChanges && (
-              <div className="flex justify-end gap-2">
-                <Button variant="outline" size="sm" onClick={() => setLocalEntries(null)}>
-                  Discard
-                </Button>
-                <Button size="sm" onClick={handleSave} disabled={saveMutation.isPending}>
-                  {saveMutation.isPending ? 'Saving…' : 'Save order'}
-                </Button>
+            <button
+              type="button"
+              onClick={toggleOptions}
+              aria-expanded={!optionsCollapsed}
+              className="inline-flex items-center gap-1 rounded-lg px-1.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            >
+              {t('strategies.moreOptions')}
+              <ChevronDown className={`size-3.5 transition-transform ${optionsCollapsed ? '-rotate-90' : ''}`} />
+            </button>
+          </div>
+
+          <p className="mt-2 text-xs text-muted-foreground">
+            {isManual ? t('strategies.modeManualHint') : t('strategies.modeScoreHint')}
+          </p>
+
+          {!optionsCollapsed && (
+            <div className="mt-3 flex flex-col items-start gap-2 border-t pt-3">
+              {/* Key selection (#919). A separate knob from the strategy above:
+                  that one ranks MODELS, this one picks between several keys of
+                  the same provider. Shown in every mode — manual chain order
+                  still leaves the choice of key open. */}
+              <label className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+                <span>{t('strategies.keySelection')}</span>
+                <select
+                  value={keySelection}
+                  disabled={strategyMutation.isPending}
+                  onChange={e => strategyMutation.mutate({ strategy, keySelectionStrategy: e.target.value as KeySelectionStrategy })}
+                  className="rounded-lg border bg-background px-2 py-1.5 text-xs text-foreground"
+                >
+                  <option value="auto">{t('strategies.keySelectionAuto')}</option>
+                  <option value="least-remaining">{t('strategies.keySelectionLeastRemaining')}</option>
+                </select>
+                <Tooltip text={t('strategies.keySelectionHint')}>
+                  <span className="cursor-help underline decoration-dotted underline-offset-2">?</span>
+                </Tooltip>
+              </label>
+
+              {/* Cooldown ceiling (#952). Caps the router's OWN bench guesses
+                  (escalation ladder, 402/403 day benches); provider-stated
+                  retry times are never shortened. Shown in every mode: the
+                  ladder runs regardless of how models are ranked. */}
+              <label className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+                <span>{t('strategies.cooldownCeiling')}</span>
+                <select
+                  value={routing?.cooldownCeilingMs == null ? '' : String(routing.cooldownCeilingMs)}
+                  disabled={strategyMutation.isPending}
+                  onChange={e => strategyMutation.mutate({ strategy, cooldownCeilingMs: e.target.value === '' ? null : Number(e.target.value) })}
+                  className="rounded-lg border bg-background px-2 py-1.5 text-xs text-foreground"
+                >
+                  <option value="">{t('strategies.cooldownCeilingDefault')}</option>
+                  <option value={String(10 * 60_000)}>{t('strategies.cooldownCeiling10m')}</option>
+                  <option value={String(60 * 60_000)}>{t('strategies.cooldownCeiling1h')}</option>
+                  <option value={String(6 * 60 * 60_000)}>{t('strategies.cooldownCeiling6h')}</option>
+                </select>
+                <Tooltip text={t('strategies.cooldownCeilingHint')}>
+                  <span className="cursor-help underline decoration-dotted underline-offset-2">?</span>
+                </Tooltip>
+              </label>
+
+              {/* Exploration toggle (#685 follow-up): a niche knob that gives
+                  unmeasured models a guaranteed chance to be tried so they build
+                  reliability/speed data. Hidden in Manual mode, where
+                  routeRequest ignores it. */}
+              {!isManual && (
+                <label className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={routing?.exploreEnabled ?? false}
+                    disabled={strategyMutation.isPending}
+                    onChange={e => strategyMutation.mutate({ strategy, exploreEnabled: e.target.checked })}
+                    className="size-3.5 accent-foreground"
+                  />
+                  <span>{t('strategies.explore')}</span>
+                  <Tooltip text={t('strategies.exploreHint')}>
+                    <span className="cursor-help underline decoration-dotted underline-offset-2">?</span>
+                  </Tooltip>
+                </label>
+              )}
+
+              {/* Peak-hours adjustment (#760): an opt-in tweak to the preset
+                  weights, and off it does nothing at all. Its "(peak hours)"
+                  marker on the weight summary above stays visible either way —
+                  that one explains live behaviour. */}
+              {!isManual && routing && (
+                <PeakHoursControls
+                  routing={routing}
+                  strategy={strategy}
+                  saving={strategyMutation.isPending}
+                  onSave={p => strategyMutation.mutate({ strategy, ...p })}
+                />
+              )}
+            </div>
+          )}
+
+        </section>
+
+        {/* Named fallback chains (#960/#895): list/create/activate/delete.
+            Activating a chain makes the table below edit that chain. */}
+        <ChainManager />
+
+        <PenaltyInspector />
+
+        {/* Unified routing / fallback table */}
+        {isLoading ? (
+          <TableSkeleton rows={8} />
+        ) : orderedGroups.length === 0 ? (
+          <EmptyState
+            icon={Boxes}
+            title={t('models.noModelsTitle')}
+            description={<>{t('models.noModelsBefore')}<Link to="/keys" className="underline text-foreground">{t('models.keysPageLink')}</Link>{t('models.noModelsAfter')}</>}
+            action={
+              <Link to="/keys">
+                <Button size="sm">{t('setup.step1Cta')}</Button>
+              </Link>
+            }
+          />
+        ) : (
+          <>
+            {/* Catalog toolbar: search + capability/context filters (#343) */}
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="relative w-full sm:max-w-xs">
+                <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                <input
+                  value={search}
+                  onChange={e => setSearch(e.target.value)}
+                  placeholder={t('models.searchPlaceholder')}
+                  aria-label={t('models.searchPlaceholder')}
+                  className="w-full rounded-xl border bg-card py-1.5 pl-9 pr-8 text-sm outline-none transition-colors focus:border-foreground/30"
+                />
+                {search && (
+                  <button
+                    onClick={() => setSearch('')}
+                    aria-label={t('models.clearSearch')}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                  >
+                    <X className="size-4" />
+                  </button>
+                )}
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  onClick={() => setFilterVision(v => !v)}
+                  aria-pressed={filterVision}
+                  className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${filterVision ? 'bg-foreground text-background border-foreground font-medium' : 'text-muted-foreground hover:text-foreground hover:bg-muted'}`}
+                >
+                  {t('models.vision')}
+                </button>
+                <button
+                  onClick={() => setFilterTools(v => !v)}
+                  aria-pressed={filterTools}
+                  className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${filterTools ? 'bg-foreground text-background border-foreground font-medium' : 'text-muted-foreground hover:text-foreground hover:bg-muted'}`}
+                >
+                  {t('models.tools')}
+                </button>
+                <div className="inline-flex items-center gap-1 rounded-xl border p-1" role="group" aria-label={t('models.ctxTitle')}>
+                  {CTX_BUCKETS.map(b => (
+                    <button
+                      key={b.key}
+                      onClick={() => setMinContext(b.key)}
+                      className={`px-2.5 py-1 text-xs rounded-lg transition-colors tabular-nums ${minContext === b.key ? 'bg-foreground text-background font-medium' : 'text-muted-foreground hover:text-foreground hover:bg-muted'}`}
+                    >
+                      {b.tKey ? t(`models.${b.tKey}`) : b.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="inline-flex items-center gap-1 rounded-xl border p-1" role="group" aria-label={t('models.bulkToggle')}>
+                  <Tooltip text={t('models.enableAllHint')}>
+                    <button
+                      onClick={() => handleBulkToggle(true)}
+                      disabled={visibleEnabledCount === visibleGroups.length}
+                      className="rounded-lg px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40 disabled:hover:bg-transparent"
+                    >
+                      {t('models.enableAll')}
+                    </button>
+                  </Tooltip>
+                  <Tooltip text={t('models.disableAllHint')}>
+                    <button
+                      onClick={() => handleBulkToggle(false)}
+                      disabled={visibleEnabledCount === 0}
+                      className="rounded-lg px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40 disabled:hover:bg-transparent"
+                    >
+                      {t('models.disableAll')}
+                    </button>
+                  </Tooltip>
+                </div>
+              </div>
+            </div>
+
+            <p className="text-xs text-muted-foreground">
+              {t('models.enabledOfShown', { enabled: visibleEnabledCount, shown: visibleGroups.length })}
+            </p>
+
+            {filtersActive && (
+              <div className="flex items-center justify-between text-xs text-muted-foreground">
+                <span>{t('models.showingCount', { shown: visibleGroups.length, total: orderedGroups.length })}</span>
+                <button onClick={clearFilters} className="underline hover:text-foreground">{t('models.clearFilters')}</button>
               </div>
             )}
 
+            {/* DndContext must wrap OUTSIDE the table: it renders hidden a11y
+                live-region <div>s, which are invalid as direct <table> children. */}
+            {visibleGroups.length === 0 ? (
+              <EmptyState
+                title={t('models.noMatches')}
+                action={
+                  <Button variant="outline" size="sm" onClick={clearFilters}>{t('models.clearFilters')}</Button>
+                }
+              />
+            ) : draggable ? (
+              <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleGroupedDragEnd}>
+                <div className="rounded-2xl border overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <ModelTableHead />
+                    <SortableContext items={renderedGroups.map(g => `grp:${g.key}`)} strategy={verticalListSortingStrategy}>
+                      <tbody>
+                        {renderedGroups.map(g => (
+                          <SortableGroupRow key={g.key} group={g} rank={rankByKey.get(g.key) ?? 0} editableRank onMoveRank={r => handleMoveGroupRank(g.key, r)} onToggleGroup={handleGroupToggle} allRows={rows} rateUsage={rateUsageByModel} />
+                        ))}
+                      </tbody>
+                    </SortableContext>
+                  </table>
+                </div>
+              </DndContext>
+            ) : (
+              <div className="rounded-2xl border overflow-x-auto">
+                <table className="w-full text-sm">
+                  <ModelTableHead />
+                  <tbody>
+                    {renderedGroups.map(g => (
+                      <tr
+                        key={g.key}
+                        onClick={() => navigate(`/models/chat/${encodeURIComponent(g.members[0].canonicalId ?? g.members[0].modelId)}`)}
+                        className={`group/row border-b last:border-0 cursor-pointer transition-colors hover:[&>td]:bg-muted/50 [&>td:first-child]:rounded-l-lg [&>td:last-child]:rounded-r-lg ${g.members.some(m => m.enabled) ? (isGroupDepleted(g.members, rateUsageByModel) ? 'opacity-60' : '') : 'opacity-50'}`}
+                      >
+                        <GroupHeaderCells group={g} rank={rankByKey.get(g.key) ?? 0} onToggleGroup={handleGroupToggle} allRows={rows} rateUsage={rateUsageByModel} />
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {/* Invisible sentinel: when it nears the viewport the next row chunk
+                renders. Present only while rows remain, so IO never fires idle. */}
+            {hasMoreRows && <div ref={sentinelRef} className="h-px" aria-hidden="true" />}
+
+            {/* Floating action bar — fixed to the viewport so it's always visible,
+                sliding up when there are unsaved changes and back down on save/discard. */}
+            <FloatingBar show={hasChanges}>
+              <span className="text-xs text-muted-foreground">{t('common.unsavedChanges')}</span>
+              <Button variant="outline" size="sm" onClick={() => setLocalEntries(null)}>{t('common.discard')}</Button>
+              <Button size="sm" onClick={handleSave} disabled={saveMutation.isPending}>
+                {saveMutation.isPending ? t('common.saving') : t('common.saveChanges')}
+              </Button>
+            </FloatingBar>
+
             {unconfiguredPlatforms.length > 0 && (
-              <p className="text-xs text-muted-foreground">
-                Hidden (no keys): {unconfiguredPlatforms.join(', ')}
-              </p>
+              <p className="text-xs text-muted-foreground">{t('models.hiddenNoKeys', { platforms: unconfiguredPlatforms.join(', ') })}</p>
             )}
           </>
         )}

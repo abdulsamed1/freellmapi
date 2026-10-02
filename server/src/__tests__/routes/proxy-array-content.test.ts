@@ -7,7 +7,8 @@ import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
 let dashToken = '';
 
 async function request(app: Express, method: string, path: string, body?: any, headers: Record<string, string> = {}) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const url = `http://127.0.0.1:${addr.port}${path}`;
 
@@ -132,6 +133,59 @@ describe('OpenAI multimodal array content', () => {
     expect(body.choices[0].message.content).toBe('got it');
   });
 
+  // #325: the dashboard Playground attaches files by downscaling images to a
+  // data URI and inlining text-like files as fenced blocks. This pins the exact
+  // envelope it emits, so a change on either side breaks here first.
+  it('round-trips a Playground file-attachment payload to the provider (mocked groq)', async () => {
+    const dataUri = 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAA==';
+    let upstream: any = null;
+
+    const origFetch = global.fetch;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr.includes('api.groq.com/openai/v1/chat/completions')) {
+        upstream = JSON.parse(String((init as RequestInit).body));
+        return {
+          ok: true,
+          json: () => Promise.resolve({
+            id: 'chatcmpl-upload', object: 'chat.completion', created: 1,
+            model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+            choices: [{ index: 0, message: { role: 'assistant', content: 'a red square' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 9, completion_tokens: 3, total_tokens: 12 },
+          }),
+        } as any;
+      }
+      return origFetch(url, init);
+    });
+
+    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'auto',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'what colour is it?\n\nnotes.md:\n```markdown\ncontext\n```' },
+          { type: 'image_url', image_url: { url: dataUri } },
+        ],
+      }],
+    }, authHeaders());
+
+    expect(status).toBe(200);
+    expect(body.choices[0].message.content).toBe('a red square');
+
+    // The image survives to the provider verbatim: the router must have picked a
+    // vision-capable model (the precheck 422s otherwise) and the adapter must
+    // forward the block rather than flattening it to text.
+    const routed = getDb()
+      .prepare("SELECT supports_vision FROM models WHERE platform = 'groq' AND model_id = ?")
+      .get(upstream.model) as { supports_vision: number } | undefined;
+    expect(routed?.supports_vision).toBe(1);
+
+    const content = upstream.messages[0].content;
+    expect(Array.isArray(content)).toBe(true);
+    expect(content[0]).toEqual({ type: 'text', text: 'what colour is it?\n\nnotes.md:\n```markdown\ncontext\n```' });
+    expect(content[1]).toEqual({ type: 'image_url', image_url: { url: dataUri } });
+  });
+
   it('rejects an empty array as missing content', async () => {
     const { status } = await request(app, 'POST', '/v1/chat/completions', {
       messages: [], // top-level empty messages
@@ -139,10 +193,211 @@ describe('OpenAI multimodal array content', () => {
     expect(status).toBe(400);
   });
 
-  it('rejects an assistant message with neither content nor tool_calls', async () => {
-    const { status } = await request(app, 'POST', '/v1/chat/completions', {
-      messages: [{ role: 'assistant', content: [] }],
+  it('accepts an assistant message with empty content and no tool_calls (#165)', async () => {
+    // OpenAI accepts empty/null assistant turns in history; we coerce to "" and
+    // forward rather than 400-ing a payload OpenAI would take. The request then
+    // routes (and fails downstream on the fake key) — the point is it is NOT a
+    // 400 schema rejection.
+    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: [] },
+        { role: 'user', content: 'continue' },
+      ],
     }, authHeaders());
-    expect(status).toBe(400);
+    expect(status).not.toBe(400);
+    if (status === 400) throw new Error(`unexpected 400: ${JSON.stringify(body)}`);
+  });
+
+  // #200: code agents (AionUI, OpenCode, Qwen Code) fail on the SECOND request
+  // of a session because their follow-up history carries shapes the strict
+  // schema rejected. Each case below is a real second-turn payload pattern.
+  describe('agent second-turn shapes (#200)', () => {
+    it('accepts Gemini-part-style content blocks without a type field', async () => {
+      const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+        messages: [
+          { role: 'user', content: [{ text: 'hi' }] },
+          { role: 'assistant', content: [{ text: 'hello!' }] },
+          { role: 'user', content: [{ text: 'ok' }] },
+        ],
+      }, authHeaders());
+      expect(status).not.toBe(400);
+      if (status === 400) throw new Error(`unexpected 400: ${JSON.stringify(body)}`);
+    });
+
+    it('accepts echoed tool_calls without type and with object arguments', async () => {
+      const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+        messages: [
+          { role: 'user', content: 'list files' },
+          {
+            role: 'assistant',
+            content: null,
+            // type dropped + arguments already parsed to an object — the way
+            // Gemini-lineage agents replay our tool_calls back at us.
+            tool_calls: [{ id: 'call_1', function: { name: 'ls', arguments: { path: '.' } } }],
+          },
+          { role: 'tool', tool_call_id: 'call_1', content: 'file1.ts' },
+          { role: 'user', content: 'thanks' },
+        ],
+      }, authHeaders());
+      expect(status).not.toBe(400);
+      if (status === 400) throw new Error(`unexpected 400: ${JSON.stringify(body)}`);
+    });
+
+    it('accepts the developer role (newer OpenAI SDK system prompt)', async () => {
+      const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+        messages: [
+          { role: 'developer', content: 'You are a coding agent.' },
+          { role: 'user', content: 'hi' },
+        ],
+      }, authHeaders());
+      expect(status).not.toBe(400);
+      if (status === 400) throw new Error(`unexpected 400: ${JSON.stringify(body)}`);
+    });
+
+    it('reports the failing path in 400 validation errors', async () => {
+      const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+        messages: [{ role: 'user', content: 42 }],
+      }, authHeaders());
+      expect(status).toBe(400);
+      // Path-qualified detail ("messages.0...") instead of a bare "Invalid input"
+      expect(body.error.message).toMatch(/messages\.0/);
+    });
+
+    it('accepts tool_calls with missing or empty ids and pairs tool results by order', async () => {
+      const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+        messages: [
+          { role: 'user', content: 'list files' },
+          {
+            role: 'assistant',
+            content: null,
+            // Gemini-lineage: no id at all on the first, empty id on the second.
+            tool_calls: [
+              { function: { name: 'ls', arguments: '{}' } },
+              { id: '', function: { name: 'pwd', arguments: '{}' } },
+            ],
+          },
+          { role: 'tool', content: 'file1.ts' },
+          { role: 'tool', tool_call_id: '', content: '/home' },
+          { role: 'user', content: 'thanks' },
+        ],
+      }, authHeaders());
+      expect(status).not.toBe(400);
+      if (status === 400) throw new Error(`unexpected 400: ${JSON.stringify(body)}`);
+    });
+
+    it('accepts a tool message with null content (tool returned nothing)', async () => {
+      const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+        messages: [
+          { role: 'user', content: 'do it' },
+          { role: 'assistant', content: null, tool_calls: [{ id: 'c1', function: { name: 'noop', arguments: '{}' } }] },
+          { role: 'tool', tool_call_id: 'c1', content: null },
+          { role: 'user', content: 'ok' },
+        ],
+      }, authHeaders());
+      expect(status).not.toBe(400);
+      if (status === 400) throw new Error(`unexpected 400: ${JSON.stringify(body)}`);
+    });
+
+    it('accepts the legacy function role in history', async () => {
+      const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+        messages: [
+          { role: 'user', content: 'weather?' },
+          { role: 'function', name: 'get_weather', content: '{"temp": 20}' },
+          { role: 'user', content: 'thanks' },
+        ],
+      }, authHeaders());
+      expect(status).not.toBe(400);
+      if (status === 400) throw new Error(`unexpected 400: ${JSON.stringify(body)}`);
+    });
+
+    it('accepts max_tokens <= 0 (treated as no limit)', async () => {
+      for (const value of [-1, 0]) {
+        const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+          max_tokens: value,
+          messages: [{ role: 'user', content: 'hi' }],
+        }, authHeaders());
+        expect(status).not.toBe(400);
+        if (status === 400) throw new Error(`unexpected 400 for max_tokens ${value}: ${JSON.stringify(body)}`);
+      }
+    });
+
+    it('accepts tool_choice "any" and tools without a type field', async () => {
+      const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+        tool_choice: 'any',
+        tools: [{ function: { name: 'ls', parameters: { type: 'object', properties: {} } } }],
+        messages: [{ role: 'user', content: 'hi' }],
+      }, authHeaders());
+      expect(status).not.toBe(400);
+      if (status === 400) throw new Error(`unexpected 400: ${JSON.stringify(body)}`);
+    });
+
+    it('accepts an assistant echo with tool_calls: null (aionrs/AionUI session replay)', async () => {
+      // The exact second-turn shape captured from aionrs v0.1.28 (AionUI's
+      // engine): resumed sessions replay the assistant turn with an explicit
+      // tool_calls: null plus a reasoning_content side field.
+      const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+        max_tokens: 8192,
+        messages: [
+          { role: 'system', content: 'You are an AI assistant.' },
+          { role: 'user', content: 'ciao' },
+          {
+            role: 'assistant',
+            content: 'Ciao! Come posso aiutarti oggi?',
+            reasoning_content: 'The user is greeting me in Italian.',
+            tool_calls: null,
+          },
+          { role: 'user', content: 'Che modello sei' },
+        ],
+      }, authHeaders());
+      expect(status).not.toBe(400);
+      if (status === 400) throw new Error(`unexpected 400: ${JSON.stringify(body)}`);
+    });
+
+    it('accepts null top-level tool knobs (tools, tool_choice, parallel_tool_calls)', async () => {
+      const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+        tools: null,
+        tool_choice: null,
+        parallel_tool_calls: null,
+        messages: [{ role: 'user', content: 'hi' }],
+      }, authHeaders());
+      expect(status).not.toBe(400);
+      if (status === 400) throw new Error(`unexpected 400: ${JSON.stringify(body)}`);
+    });
+
+    it('drops null/empty tool_calls instead of forwarding them upstream', async () => {
+      const origFetch = global.fetch;
+      vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+        const urlStr = typeof url === 'string' ? url : url.toString();
+        if (urlStr.includes('api.groq.com/openai/v1/chat/completions')) {
+          const body = JSON.parse(String((init as RequestInit).body));
+          // Strict upstreams reject tool_calls: null AND tool_calls: [] —
+          // neither may survive normalization.
+          expect(body.messages[1]).not.toHaveProperty('tool_calls');
+          expect(body.messages[2]).not.toHaveProperty('tool_calls');
+          return {
+            ok: true,
+            json: () => Promise.resolve({
+              id: 'chatcmpl-nulltc', object: 'chat.completion', created: 1, model: 'openai/gpt-oss-120b',
+              choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+              usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 },
+            }),
+          } as any;
+        }
+        return origFetch(url, init);
+      });
+
+      const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+        model: 'auto',
+        messages: [
+          { role: 'user', content: 'ciao' },
+          { role: 'assistant', content: 'Ciao!', tool_calls: null },
+          { role: 'assistant', content: 'ancora', tool_calls: [] },
+          { role: 'user', content: 'Che modello sei' },
+        ],
+      }, authHeaders());
+      expect(status).toBe(200);
+      expect(body.choices[0].message.content).toBe('ok');
+    });
   });
 });
