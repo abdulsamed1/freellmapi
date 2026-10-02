@@ -77,8 +77,17 @@ function isBackupableTable(name: string): boolean {
 
 /** Every table a dump may contain, in a stable order. */
 export function listTables(db: Db = getDb()): string[] {
-  const rows = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as { name: string }[];
-  return rows.map((row) => row.name).filter(isBackupableTable);
+  const rows = db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as {
+    name: string;
+    sql: string | null;
+  }[];
+  const virtualTables = rows
+    .filter((row) => /^CREATE VIRTUAL TABLE\b/i.test(row.sql ?? ''))
+    .map((row) => row.name);
+  return rows
+    .map((row) => row.name)
+    .filter(isBackupableTable)
+    .filter((name) => !virtualTables.some((table) => name.startsWith(`${table}_`)));
 }
 
 /* ------------------------------------------------------------------ */
@@ -240,7 +249,9 @@ function sqliteEscape(value: unknown): string {
 function sqliteCreateTable(db: Db, table: string): string | null {
   const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) as { sql: string } | undefined;
   if (!row?.sql) return null;
-  return `${row.sql.replace(/^CREATE TABLE/i, 'CREATE TABLE IF NOT EXISTS')};`;
+  return `${row.sql
+    .replace(/^CREATE TABLE/i, 'CREATE TABLE IF NOT EXISTS')
+    .replace(/^CREATE VIRTUAL TABLE/i, 'CREATE VIRTUAL TABLE IF NOT EXISTS')};`;
 }
 
 function sqliteDumpTable(db: Db, table: string): string {
