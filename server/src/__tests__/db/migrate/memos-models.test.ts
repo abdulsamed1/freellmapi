@@ -22,6 +22,20 @@ function makeDb(): Database.Database {
       priority INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
       UNIQUE(model_db_id)
     );
+    CREATE TABLE profiles (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      auto_include_new_models INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE TABLE profile_models (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      profile_id INTEGER NOT NULL REFERENCES profiles(id),
+      model_db_id INTEGER NOT NULL REFERENCES models(id),
+      priority INTEGER NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      UNIQUE(profile_id, model_db_id)
+    );
+    INSERT INTO profiles (name) VALUES ('Default');
     INSERT INTO models (
       platform, model_id, display_name, intelligence_rank, speed_rank, size_label
     ) VALUES ('other', 'existing', 'Existing', 1, 1, 'Large');
@@ -71,6 +85,44 @@ describe('MemOS catalog models migration', () => {
       { platform: 'other', model_id: 'existing', source: 'catalog' },
       { platform: 'memos', model_id: 'deepseek-r1', source: 'user' },
     ]);
+  });
+
+  it('adds seeded models to auto-including profile chains', () => {
+    const db = makeDb();
+    dbs.push(db);
+    up(db);
+
+    expect(db.prepare(`
+      SELECT m.model_id, pm.priority, pm.enabled
+        FROM profile_models pm
+        JOIN models m ON m.id = pm.model_db_id
+       WHERE pm.profile_id = 1
+       ORDER BY pm.priority
+    `).all()).toEqual([
+      { model_id: 'deepseek-r1', priority: 1, enabled: 1 },
+      { model_id: 'qwen2.5-72b-instruct', priority: 2, enabled: 1 },
+      { model_id: 'qwen3-32b', priority: 3, enabled: 1 },
+    ]);
+  });
+
+  it('does not remove pre-existing profile links on down', () => {
+    const db = makeDb();
+    dbs.push(db);
+    const model = db.prepare(`
+      INSERT INTO models (
+        platform, model_id, display_name, intelligence_rank, speed_rank, size_label
+      ) VALUES ('memos', 'deepseek-r1', 'Existing', 1, 1, 'Medium')
+    `).run();
+    db.prepare('INSERT INTO profile_models (profile_id, model_db_id, priority) VALUES (1, ?, 1)')
+      .run(model.lastInsertRowid);
+
+    up(db);
+    down(db);
+
+    expect(db.prepare(`
+      SELECT profile_id, model_db_id, priority
+        FROM profile_models
+    `).all()).toEqual([{ profile_id: 1, model_db_id: 2, priority: 1 }]);
   });
 
   it('preserves pre-existing catalog rows and custom endpoint scopes on down', () => {

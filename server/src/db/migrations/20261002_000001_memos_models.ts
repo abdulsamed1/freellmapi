@@ -4,6 +4,7 @@
 // DOWN: reversible
 
 import type { Db } from '../types.js';
+import { ensureModelInProfiles } from '../../services/profile-models.js';
 
 const MODELS = [
   ['deepseek-r1', 'DeepSeek R1'],
@@ -54,6 +55,20 @@ export function up(db: Db): void {
             VALUES ('fallback', ?)
           `).run(fallbackInsert.lastInsertRowid);
         }
+        const before = new Set((db.prepare(
+          'SELECT id FROM profile_models WHERE model_db_id = ?',
+        ).all(model.id) as { id: number }[]).map(row => row.id));
+        ensureModelInProfiles(db, model.id);
+        const profileRows = db.prepare(
+          'SELECT id FROM profile_models WHERE model_db_id = ?',
+        ).all(model.id) as { id: number }[];
+        const recordProfileRow = db.prepare(`
+          INSERT INTO memos_models_migration_rows (row_type, row_id)
+          VALUES ('profile_model', ?)
+        `);
+        for (const row of profileRows) {
+          if (!before.has(row.id)) recordProfileRow.run(row.id);
+        }
       }
     });
   })();
@@ -70,6 +85,12 @@ export function down(db: Db): void {
         PRIMARY KEY (row_type, row_id)
       )
     `);
+    db.prepare(`
+      DELETE FROM profile_models
+       WHERE id IN (
+         SELECT row_id FROM memos_models_migration_rows WHERE row_type = 'profile_model'
+       )
+    `).run();
     db.prepare(`
       DELETE FROM fallback_config
        WHERE id IN (
