@@ -72,4 +72,36 @@ describe('MemOS catalog models migration', () => {
       { platform: 'memos', model_id: 'deepseek-r1', source: 'user' },
     ]);
   });
+
+  it('preserves pre-existing catalog rows and custom endpoint scopes on down', () => {
+    const db = makeDb();
+    dbs.push(db);
+    db.prepare(`
+      INSERT INTO models (
+        platform, model_id, display_name, intelligence_rank, speed_rank,
+        key_id, source, endpoint_scope
+      ) VALUES
+        ('memos', 'deepseek-r1', 'Existing default', 1, 1, NULL, 'catalog', ''),
+        ('memos', 'deepseek-r1', 'Existing custom', 1, 1, NULL, 'catalog', 'custom-endpoint')
+    `).run();
+
+    up(db);
+    down(db);
+
+    expect(db.prepare(`
+      SELECT model_id, display_name, source, endpoint_scope
+        FROM models
+       WHERE platform = 'memos'
+       ORDER BY endpoint_scope
+    `).all()).toEqual([
+      { model_id: 'deepseek-r1', display_name: 'Existing default', source: 'catalog', endpoint_scope: '' },
+      { model_id: 'deepseek-r1', display_name: 'Existing custom', source: 'catalog', endpoint_scope: 'custom-endpoint' },
+    ]);
+    expect(db.prepare(`
+      SELECT COUNT(*) AS count
+        FROM fallback_config f
+        JOIN models m ON m.id = f.model_db_id
+       WHERE m.platform = 'memos'
+    `).get()).toEqual({ count: 0 });
+  });
 });

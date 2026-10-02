@@ -12,6 +12,13 @@ const MODELS = [
 ] as const;
 
 export function up(db: Db): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS memos_models_migration_rows (
+      row_type TEXT NOT NULL,
+      row_id INTEGER NOT NULL,
+      PRIMARY KEY (row_type, row_id)
+    )
+  `);
   const insertModel = db.prepare(`
     INSERT OR IGNORE INTO models (
       platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
@@ -21,7 +28,8 @@ export function up(db: Db): void {
   `);
   const findModel = db.prepare(`
     SELECT id FROM models
-     WHERE platform = 'memos' AND model_id = ? AND source = 'catalog' AND key_id IS NULL
+     WHERE platform = 'memos' AND model_id = ? AND source = 'catalog'
+       AND key_id IS NULL AND endpoint_scope = ''
   `);
   const insertFallback = db.prepare(
     'INSERT OR IGNORE INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)',
@@ -30,27 +38,50 @@ export function up(db: Db): void {
   db.transaction(() => {
     const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS value FROM fallback_config').get() as { value: number }).value;
     MODELS.forEach(([modelId, displayName], index) => {
-      insertModel.run('memos', modelId, displayName);
+      const modelInsert = insertModel.run('memos', modelId, displayName);
+      if (modelInsert.changes === 1) {
+        db.prepare(`
+          INSERT INTO memos_models_migration_rows (row_type, row_id)
+          VALUES ('model', ?)
+        `).run(modelInsert.lastInsertRowid);
+      }
       const model = findModel.get(modelId) as { id: number } | undefined;
-      if (model) insertFallback.run(model.id, maxPriority + index + 1);
+      if (model) {
+        const fallbackInsert = insertFallback.run(model.id, maxPriority + index + 1);
+        if (fallbackInsert.changes === 1) {
+          db.prepare(`
+            INSERT INTO memos_models_migration_rows (row_type, row_id)
+            VALUES ('fallback', ?)
+          `).run(fallbackInsert.lastInsertRowid);
+        }
+      }
     });
   })();
 }
 
 export function down(db: Db): void {
   db.transaction(() => {
+    // Older executions of this migration did not create the ownership table;
+    // in that case there are no rows this rollback can safely claim.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS memos_models_migration_rows (
+        row_type TEXT NOT NULL,
+        row_id INTEGER NOT NULL,
+        PRIMARY KEY (row_type, row_id)
+      )
+    `);
     db.prepare(`
       DELETE FROM fallback_config
-       WHERE model_db_id IN (
-         SELECT id FROM models
-          WHERE platform = 'memos' AND source = 'catalog' AND key_id IS NULL
-            AND model_id IN ('deepseek-r1', 'qwen2.5-72b-instruct', 'qwen3-32b')
+       WHERE id IN (
+         SELECT row_id FROM memos_models_migration_rows WHERE row_type = 'fallback'
        )
     `).run();
     db.prepare(`
       DELETE FROM models
-       WHERE platform = 'memos' AND source = 'catalog' AND key_id IS NULL
-         AND model_id IN ('deepseek-r1', 'qwen2.5-72b-instruct', 'qwen3-32b')
+       WHERE id IN (
+         SELECT row_id FROM memos_models_migration_rows WHERE row_type = 'model'
+       )
     `).run();
+    db.exec('DROP TABLE memos_models_migration_rows');
   })();
 }

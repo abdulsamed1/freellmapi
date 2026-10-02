@@ -260,12 +260,37 @@ function snapshotAppState(db: Database.Database): DatabaseSnapshot {
 
 function normalizeGeneratedIds(snapshot: DatabaseSnapshot): DatabaseSnapshot {
   const rows = { ...snapshot.rows };
+  const modelKeysById = new Map(
+    rows.models.map(row => {
+      const model = row as Record<string, unknown>;
+      return [model.id, `${model.platform}\u0000${model.model_id}\u0000${model.endpoint_scope ?? ''}`];
+    }),
+  );
+  const fallbackKeysById = new Map(
+    rows.fallback_config.map(row => {
+      const fallback = row as Record<string, unknown>;
+      return [
+        fallback.id,
+        `${modelKeysById.get(fallback.model_db_id) ?? `missing-model:${fallback.model_db_id}`}\u0000${fallback.priority}\u0000${fallback.enabled}`,
+      ];
+    }),
+  );
 
-  for (const tableName of ['models', 'fallback_config']) {
+  for (const tableName of ['models', 'fallback_config', 'memos_models_migration_rows']) {
     rows[tableName] = rows[tableName].map(row => {
       const normalized = { ...(row as Record<string, unknown>) };
-      delete normalized.id;
-      if (tableName === 'fallback_config') delete normalized.model_db_id;
+      if (tableName === 'models') {
+        delete normalized.id;
+      } else if (tableName === 'fallback_config') {
+        normalized.model_db_key = modelKeysById.get(normalized.model_db_id) ?? `missing-model:${normalized.model_db_id}`;
+        delete normalized.id;
+        delete normalized.model_db_id;
+      } else {
+        normalized.row_key = normalized.row_type === 'model'
+          ? modelKeysById.get(normalized.row_id) ?? `missing-model:${normalized.row_id}`
+          : fallbackKeysById.get(normalized.row_id) ?? `missing-fallback:${normalized.row_id}`;
+        delete normalized.row_id;
+      }
       return normalized;
     }).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
   }
