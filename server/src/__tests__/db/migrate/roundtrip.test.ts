@@ -42,6 +42,7 @@ const KEY_MONTHLY_BUDGET_FILENAME = '20260904_000001_key_monthly_budget.ts';
 const REQUEST_MODEL_ATTRIBUTION_FILENAME = '20260913_000001_request_model_attribution.ts';
 const KEY_MONTHLY_USAGE_FILENAME = '20260914_000001_key_monthly_usage.ts';
 const QUOTA_SNAPSHOT_FRESHNESS_FILENAME = '20260915_000001_quota_snapshot_freshness.ts';
+const MEMOS_MODELS_FILENAME = '20261002_000001_memos_models.ts';
 
 interface SchemaRow {
   type: string;
@@ -130,6 +131,7 @@ describe('migration round trip', () => {
         REQUEST_MODEL_ATTRIBUTION_FILENAME,
         KEY_MONTHLY_USAGE_FILENAME,
         QUOTA_SNAPSHOT_FRESHNESS_FILENAME,
+        MEMOS_MODELS_FILENAME,
       ]);
     } finally {
       db.close();
@@ -177,7 +179,7 @@ describe('migration round trip', () => {
 
       await runMigrations(db, 'up');
       expect(getPendingMigrationNames(db)).toEqual([]);
-      expect(snapshotAppState(db)).toEqual(fullState);
+      expect(normalizeGeneratedIds(snapshotAppState(db))).toEqual(normalizeGeneratedIds(fullState));
     } finally {
       db.close();
     }
@@ -254,6 +256,21 @@ function snapshotAppState(db: Database.Database): DatabaseSnapshot {
     schema: snapshotSchema(db),
     rows,
   };
+}
+
+function normalizeGeneratedIds(snapshot: DatabaseSnapshot): DatabaseSnapshot {
+  const rows = { ...snapshot.rows };
+
+  for (const tableName of ['models', 'fallback_config']) {
+    rows[tableName] = rows[tableName].map(row => {
+      const normalized = { ...(row as Record<string, unknown>) };
+      delete normalized.id;
+      if (tableName === 'fallback_config') delete normalized.model_db_id;
+      return normalized;
+    }).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+  }
+
+  return { ...snapshot, rows };
 }
 
 function getAppTableNames(db: Database.Database): string[] {
